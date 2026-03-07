@@ -2,10 +2,12 @@ package-as: RobUIHeal
 
 ignore:
   - .github
+  - .gitignore
   - README.md
   - readme.md
-  - CHANGELOG.md
-  - changelog.md
-  - .gitignore
 
 license-output: LICENSE.txt
+
+manual-changelog:
+  filename: CHANGELOG.md
+  markup-type: markdown
