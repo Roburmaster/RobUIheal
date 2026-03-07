@@ -2,12 +2,8 @@ local ADDON, ns = ...
 ns = _G[ADDON] or ns
 _G[ADDON] = ns
 
--- SavedVariables (safe)
-_G.RobUIHealDB = _G.RobUIHealDB or {}
-local DB = _G.RobUIHealDB
-
--- Store minimap button angle (0..360). Default: right side.
-DB.minimapButtonAngle = DB.minimapButtonAngle or 0
+-- DB is set after ADDON_LOADED, once SavedVariables are populated by the game engine.
+local DB
 
 -- ------------------------------------------------------------
 -- Helpers
@@ -160,6 +156,17 @@ minimapButton:SetScript("OnLeave", function(self)
 end)
 
 -- ------------------------------------------------------------
--- Initial position
+-- Initial position (deferred until SavedVariables are loaded)
 -- ------------------------------------------------------------
-SetButtonFromAngle(minimapButton, DB.minimapButtonAngle)
+local initFrame = CreateFrame("Frame")
+initFrame:RegisterEvent("ADDON_LOADED")
+initFrame:SetScript("OnEvent", function(self, event, addonName)
+    if addonName ~= ADDON then return end
+    self:UnregisterEvent("ADDON_LOADED")
+
+    _G.RobUIHealDB = _G.RobUIHealDB or {}
+    DB = _G.RobUIHealDB
+    DB.minimapButtonAngle = DB.minimapButtonAngle or 0
+
+    SetButtonFromAngle(minimapButton, DB.minimapButtonAngle)
+end)
