@@ -1,0 +1,11 @@
+package-as: RobUIHeal
+
+ignore:
+  - .github
+  - README.md
+  - readme.md
+  - CHANGELOG.md
+  - changelog.md
+  - .gitignore
+
+license-output: LICENSE.txt
