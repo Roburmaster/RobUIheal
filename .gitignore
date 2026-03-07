@@ -1,0 +1,22 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor folders
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# Archives
+*.zip
+*.rar
+*.7z
+
+# Lua compiled files
+*.luac
