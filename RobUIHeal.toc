@@ -1,0 +1,53 @@
+## Interface: 120001
+## Title: RobUIHeal
+## Notes: Party/Raid frames + click-casting. Optional integration into RobUI MasterConfig.
+## Author: Roburmaster
+## Version: 0.3
+## OptionalDeps: Robui
+## SavedVariables: RobHealDB, RobHealGlobalDB
+## SavedVariablesPerCharacter:RobHealDB, RobHealCharDB, HealDB, RobHealBindHelpDB, RobUIHealDB, RobUIHealBtnDB
+
+db/db.lua
+db/profile.lua
+db/settings.lua
+
+
+framefunctions/targetedspells.lua
+mouseoverhealing/spellidmouse.lua
+
+
+auras/auralib.lua
+framefunctions/dispel.lua
+auras/debuffs.lua
+auras/friendlybuffs.lua
+framefunctions/incomingheals.lua
+framefunctions/healabsorb.lua
+framefunctions/shieldabsorb.lua
+auras/aura_filters.lua
+
+
+minimap/minimapb.lua
+
+
+
+fading/range.lua
+
+blizz/blizzardframes.lua
+
+UI/party.lua
+UI/raid.lua
+UI/readycheck.lua
+
+mouseoverhealing/cast.lua
+core/core.lua
+
+mouseoverhealing/bindview.lua
+
+focus/bindview_core.lua
+focus/bindview_bindings.lua
+focus/bindview_loader.lua
+
+focus/help.lua
+
+migration_msg.lua
+

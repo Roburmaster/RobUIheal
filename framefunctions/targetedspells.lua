@@ -1,0 +1,431 @@
+-- ============================================================================
+-- targetedspells.lua (RobHeal)
+-- "Incoming / targeted spell" indicator on party/raid frames.
+--
+-- CHANGED VISUAL:
+--   - Show a SMALL RED SQUARE ABOVE the RobHeal unit button (not inside)
+--   - Still uses the original caster tracking (nameplates casting + target swap)
+--
+-- CPU FIXES:
+--   - Reuse frame list (no table alloc per event)
+--   - UNIT_TARGET: early-bail unless unit is an active caster
+--   - GROUP_ROSTER_UPDATE: no full nameplate rescan; just rebuild frames + reapply active casters
+--   - Cache DB in hot paths
+--
+-- WoW 12.0 / secret rules:
+--   - UnitIsUnit() returns a secret boolean -> ONLY use with SetAlphaFromBoolean()
+-- ============================================================================
+
+local ADDON, ns = ...
+ns = _G[ADDON] or ns
+
+ns.TargetedSpells = ns.TargetedSpells or {}
+local TS = ns.TargetedSpells
+
+local wipe = wipe
+local pairs = pairs
+local ipairs = ipairs
+local type = type
+local tostring = tostring
+local string_match = string.match
+
+local UnitExists = UnitExists
+local UnitCanAttack = UnitCanAttack
+local UnitIsUnit = UnitIsUnit
+local UnitCastingInfo = UnitCastingInfo
+local UnitChannelInfo = UnitChannelInfo
+local UnitCastingDuration = UnitCastingDuration
+local UnitChannelDuration = UnitChannelDuration
+
+-- ---------------------------------------------------------------------------
+-- DB (cached)
+-- ---------------------------------------------------------------------------
+local function GetDB_Fallback()
+    local db = ns:GetDB()
+    db.targetedSpells = db.targetedSpells or { enabled = true, maxIcons = 1 }
+    return db.targetedSpells
+end
+
+local function GetDB()
+    if ns.GetTargetedSpellsDB then
+        return ns:GetTargetedSpellsDB()
+    end
+    return GetDB_Fallback()
+end
+
+local function GetDBCached()
+    if TS._db then return TS._db end
+    TS._db = GetDB()
+    return TS._db
+end
+
+-- ---------------------------------------------------------------------------
+-- Helpers
+-- ---------------------------------------------------------------------------
+local function IsNameplateUnit(unit)
+    return type(unit) == "string" and string_match(unit, "^nameplate%d+$") ~= nil
+end
+
+local function IsValidHostileCaster(unit, db)
+    if not unit or not UnitExists(unit) then return false end
+    if db.watchNameplates ~= false and not IsNameplateUnit(unit) then
+        return false
+    end
+    return UnitCanAttack("player", unit)
+end
+
+-- ---------------------------------------------------------------------------
+-- Frame list cache (no alloc per call)
+-- ---------------------------------------------------------------------------
+TS._frames = TS._frames or {}
+
+local function FramesIter()
+    local out = TS._frames
+    wipe(out)
+
+    if ns.Party and ns.Party.frames then
+        for _, f in pairs(ns.Party.frames) do
+            if f and f.unit then out[#out + 1] = f end
+        end
+    end
+
+    if ns.Raid and ns.Raid.frames then
+        for _, f in pairs(ns.Raid.frames) do
+            if f and f.unit then out[#out + 1] = f end
+        end
+    end
+
+    return out
+end
+
+-- ---------------------------------------------------------------------------
+-- UI: small red square ABOVE frame
+-- ---------------------------------------------------------------------------
+local function EnsureContainer(frame)
+    if frame._rhTSContainer then return frame._rhTSContainer end
+
+    local c = CreateFrame("Frame", nil, frame)
+    c:SetSize(10, 10)
+    c:ClearAllPoints()
+    c:SetPoint("BOTTOM", frame, "TOP", 0, 2)
+    c:SetFrameLevel(frame:GetFrameLevel() + 80)
+    c:EnableMouse(false)
+    c:SetIgnoreParentAlpha(true)
+    c:SetAlpha(1)
+    c:Hide()
+
+    local t = c:CreateTexture(nil, "OVERLAY")
+    t:SetAllPoints()
+    t:SetColorTexture(1, 0, 0, 1)
+    c.tex = t
+
+    frame._rhTSContainer = c
+    frame._rhTSIcons  = frame._rhTSIcons  or {}
+    frame._rhTSActive = frame._rhTSActive or {}
+
+    frame._rhTSIcons[1] = c
+
+    return c
+end
+
+local function EnsurePool(frame)
+    EnsureContainer(frame)
+end
+
+local function AcquireIcon(frame)
+    EnsurePool(frame)
+    return frame._rhTSIcons[1], 1
+end
+
+local function PositionIcons(frame)
+    if not frame or not frame._rhTSContainer then return end
+    frame._rhTSContainer:ClearAllPoints()
+    frame._rhTSContainer:SetPoint("BOTTOM", frame, "TOP", 0, 2)
+end
+
+-- ---------------------------------------------------------------------------
+-- Public API: Attach / UpdateFrame
+-- ---------------------------------------------------------------------------
+function TS:Attach(frame)
+    if not frame or frame._rhTSApplied then return end
+    frame._rhTSApplied = true
+    EnsureContainer(frame)
+    EnsurePool(frame)
+    PositionIcons(frame)
+end
+
+function TS:UpdateFrame(frame, unit)
+    if not frame or not frame._rhTSContainer then return end
+    frame.unit = unit or frame.unit
+
+    if not frame._rhTSActive then return end
+
+    for casterUnit, idx in pairs(frame._rhTSActive) do
+        local ic = frame._rhTSIcons and frame._rhTSIcons[idx]
+        if ic and frame.unit and UnitExists(casterUnit) then
+            local targeted = UnitIsUnit(casterUnit .. "target", frame.unit)
+            ic:SetAlphaFromBoolean(targeted, 1, 0)
+            ic:SetShown(true)
+        end
+    end
+
+    PositionIcons(frame)
+end
+
+function TS:HideAll(frame)
+    if not frame then return end
+    if frame._rhTSContainer then
+        frame._rhTSContainer:SetAlpha(0)
+        frame._rhTSContainer:Hide()
+    end
+    if frame._rhTSActive then wipe(frame._rhTSActive) end
+end
+
+-- ---------------------------------------------------------------------------
+-- Cast tracking
+-- ---------------------------------------------------------------------------
+TS.activeCasters = TS.activeCasters or {} -- [casterUnitToken] = { durObj=, texture=, isChannel=, spellID= }
+
+local function ShowOnAllFramesForCaster(casterUnit)
+    local db = GetDBCached()
+    if not db.enabled then return end
+
+    local frames = FramesIter()
+    for i = 1, #frames do
+        local frame = frames[i]
+        if frame and frame.unit and UnitExists(frame.unit) then
+            TS:Attach(frame)
+
+            local ic, iconIndex = AcquireIcon(frame)
+            frame._rhTSActive[casterUnit] = iconIndex
+
+            local targeted = UnitIsUnit(casterUnit .. "target", frame.unit)
+            ic:SetShown(true)
+            ic:SetAlphaFromBoolean(targeted, 1, 0)
+        end
+    end
+end
+
+local function HideOnAllFramesForCaster(casterUnit)
+    local frames = FramesIter()
+    for i = 1, #frames do
+        local frame = frames[i]
+        if frame and frame._rhTSActive and frame._rhTSActive[casterUnit] then
+            local idx = frame._rhTSActive[casterUnit]
+            local ic = frame._rhTSIcons and frame._rhTSIcons[idx]
+            if ic then
+                ic:SetAlpha(0)
+                ic:Hide()
+            end
+            frame._rhTSActive[casterUnit] = nil
+        end
+    end
+end
+
+local function ProcessCast(casterUnit, isChannel)
+    local db = GetDBCached()
+    if not IsValidHostileCaster(casterUnit, db) then return end
+
+    local name, _, texture, _, _, _, _, _, _, spellID
+    local durObj
+
+    if isChannel then
+        name, _, texture, _, _, _, _, spellID = UnitChannelInfo(casterUnit)
+        durObj = UnitChannelDuration(casterUnit)
+    else
+        name, _, texture, _, _, _, _, _, _, spellID = UnitCastingInfo(casterUnit)
+        durObj = UnitCastingDuration(casterUnit)
+    end
+
+    if not name or not durObj then return end
+
+    local t = TS.activeCasters[casterUnit]
+    if not t then
+        t = {}
+        TS.activeCasters[casterUnit] = t
+    end
+
+    t.spellID = spellID
+    t.texture = texture
+    t.durObj  = durObj
+    t.isChannel = isChannel
+
+    ShowOnAllFramesForCaster(casterUnit)
+end
+
+local function TargetChanged(casterUnit)
+    -- CPU FIX: only called when casterUnit is already active (see event handler)
+    if not UnitExists(casterUnit) then
+        TS.activeCasters[casterUnit] = nil
+        HideOnAllFramesForCaster(casterUnit)
+        return
+    end
+
+    local frames = FramesIter()
+    for i = 1, #frames do
+        local frame = frames[i]
+        if frame and frame.unit and frame._rhTSActive then
+            local idx = frame._rhTSActive[casterUnit]
+            local ic = idx and frame._rhTSIcons and frame._rhTSIcons[idx]
+            if ic then
+                local targeted = UnitIsUnit(casterUnit .. "target", frame.unit)
+                ic:SetShown(true)
+                ic:SetAlphaFromBoolean(targeted, 1, 0)
+            end
+        end
+    end
+end
+
+local function CastStopped(casterUnit)
+    TS.activeCasters[casterUnit] = nil
+    HideOnAllFramesForCaster(casterUnit)
+end
+
+local function ReapplyAllActiveCasters()
+    -- Called on roster changes / entering world to refresh icons on current frames
+    local frames = FramesIter()
+
+    -- hide all first (cheap)
+    for i = 1, #frames do
+        TS:HideAll(frames[i])
+    end
+
+    -- re-show for all active casters that still exist
+    for casterUnit, _ in pairs(TS.activeCasters) do
+        if UnitExists(casterUnit) then
+            ShowOnAllFramesForCaster(casterUnit)
+        else
+            TS.activeCasters[casterUnit] = nil
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Events
+-- ---------------------------------------------------------------------------
+TS.eventFrame = TS.eventFrame or CreateFrame("Frame")
+TS.eventFrame:Hide()
+
+local function OnEvent(_, event, unit)
+    if event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_EMPOWER_START" then
+        ProcessCast(unit, false)
+
+    elseif event == "UNIT_SPELLCAST_CHANNEL_START" then
+        ProcessCast(unit, true)
+
+    elseif event == "UNIT_TARGET" then
+        -- CPU FIX: UNIT_TARGET fires a LOT. Bail unless this unit is actually tracked.
+        if not unit or not TS.activeCasters[unit] then return end
+        TargetChanged(unit)
+
+    elseif event == "UNIT_SPELLCAST_STOP"
+        or event == "UNIT_SPELLCAST_FAILED"
+        or event == "UNIT_SPELLCAST_INTERRUPTED"
+        or event == "UNIT_SPELLCAST_SUCCEEDED"
+        or event == "UNIT_SPELLCAST_CHANNEL_STOP"
+        or event == "UNIT_SPELLCAST_EMPOWER_STOP"
+    then
+        if unit and TS.activeCasters[unit] then
+            CastStopped(unit)
+        end
+
+    elseif event == "NAME_PLATE_UNIT_ADDED" then
+        local db = GetDBCached()
+        if IsValidHostileCaster(unit, db) then
+            if UnitCastingInfo(unit) then
+                ProcessCast(unit, false)
+            elseif UnitChannelInfo(unit) then
+                ProcessCast(unit, true)
+            end
+        end
+
+    elseif event == "NAME_PLATE_UNIT_REMOVED" then
+        if unit and TS.activeCasters[unit] then
+            CastStopped(unit)
+        end
+
+    elseif event == "GROUP_ROSTER_UPDATE" then
+        -- CPU FIX: do NOT wipe + rescan nameplates 1..40 here (this event can spam).
+        ReapplyAllActiveCasters()
+
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        -- Hard reset once on load / zoning
+        wipe(TS.activeCasters)
+
+        -- Clean frames
+        local frames = FramesIter()
+        for i = 1, #frames do
+            TS:HideAll(frames[i])
+        end
+
+        -- Optional: scan existing nameplates once (not on roster spam)
+        local db = GetDBCached()
+        for i = 1, 40 do
+            local np = "nameplate" .. i
+            if UnitExists(np) and IsValidHostileCaster(np, db) then
+                if UnitCastingInfo(np) then
+                    ProcessCast(np, false)
+                elseif UnitChannelInfo(np) then
+                    ProcessCast(np, true)
+                end
+            end
+        end
+    end
+end
+
+TS.eventFrame:SetScript("OnEvent", OnEvent)
+
+-- ---------------------------------------------------------------------------
+-- Enable / Disable / Init
+-- ---------------------------------------------------------------------------
+function TS:Enable()
+    self._db = GetDB() -- refresh cache
+
+    local db = self._db
+    if not db.enabled then return end
+
+    local ef = self.eventFrame
+    ef:UnregisterAllEvents()
+
+    ef:RegisterEvent("UNIT_SPELLCAST_START")
+    ef:RegisterEvent("UNIT_SPELLCAST_STOP")
+    ef:RegisterEvent("UNIT_SPELLCAST_FAILED")
+    ef:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
+    ef:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
+    ef:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
+    ef:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
+    ef:RegisterEvent("UNIT_SPELLCAST_EMPOWER_START")
+    ef:RegisterEvent("UNIT_SPELLCAST_EMPOWER_STOP")
+    ef:RegisterEvent("UNIT_TARGET")
+    ef:RegisterEvent("NAME_PLATE_UNIT_ADDED")
+    ef:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
+    ef:RegisterEvent("GROUP_ROSTER_UPDATE")
+    ef:RegisterEvent("PLAYER_ENTERING_WORLD")
+
+    ef:Show()
+
+    -- do a one-time init scan/refresh
+    OnEvent(nil, "PLAYER_ENTERING_WORLD")
+end
+
+function TS:Disable()
+    local ef = self.eventFrame
+    ef:UnregisterAllEvents()
+    ef:Hide()
+
+    local frames = FramesIter()
+    for i = 1, #frames do
+        TS:HideAll(frames[i])
+    end
+
+    wipe(self.activeCasters)
+end
+
+function TS:Init()
+    self._db = GetDB() -- refresh cache
+    if self._db.enabled then
+        self:Enable()
+    else
+        self:Disable()
+    end
+end

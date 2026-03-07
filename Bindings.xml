@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE Bindings SYSTEM "Bindings.dtd">
+<Bindings>
+    <Binding name="ROBHEAL_BINDVIEW_SELECTREMOVE">
+        if RobHeal_BindViewKeyButton then
+        RobHeal_BindViewKeyButton:Click()
+        end
+    </Binding>
+</Bindings>
