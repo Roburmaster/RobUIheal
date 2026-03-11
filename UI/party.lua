@@ -256,8 +256,8 @@ local function CreateUnitButton()
 
     if not btn._hpPctOverlay then
         local o = CreateFrame("Frame", nil, UIParent)
-        o:SetFrameStrata("TOOLTIP")
-        o:SetFrameLevel(9999)
+        o:SetFrameStrata("MEDIUM") -- Lowered to standard UI layer
+        o:SetFrameLevel(btn:GetFrameLevel() + 2) -- Just slightly above the button itself
         o:SetClampedToScreen(true)
         o:Show()
 
