@@ -1,4 +1,3 @@
--- v1.1 
 -- ============================================================================
 -- range.lua (RobHeal)
 --
@@ -6,24 +5,25 @@
 -- -------
 -- Handles range-based fading for Party and Raid frames only.
 --
--- Design decisions
--- ----------------
--- 1) No hostile checks
---    Party/Raid frames are friendly units, so hostile logic is wasted work.
+-- Important
+-- ---------
+-- This file must stay combat-safe in WoW Midnight.
 --
--- 2) Friendly spell classes use spell range only
---    For healer/support classes, spell range is the correct and precise check.
+-- Safe design:
+--   • No hostile checks
+--   • No CheckInteractDistance
+--   • No UnitInRange
+--   • No item-based fallback
 --
--- 3) Classes without a friendly spell use CheckInteractDistance fallback
---    This gives Warrior / DK / Rogue / Mage / Hunter / DH a cheap fallback.
+-- Reason:
+--   • CheckInteractDistance caused ADDON_ACTION_BLOCKED
+--   • UnitInRange / spell APIs may return secret booleans
+--   • We only use spell range where it is actually available
 --
--- 4) Midnight-safe
---    WoW can return secret booleans. Never test range API returns directly.
---    All range results are sanitized through pcall wrappers.
---
--- 5) CPU-budgeted
---    Only a limited number of frames are processed per tick.
---    Frames are processed round-robin instead of scanning every frame every update.
+-- Final rule set:
+--   • Classes with friendly spell range use spell range
+--   • Classes without friendly spell range do not force fallback here
+--   • Unknown result keeps previous latched state
 -- ============================================================================
 
 local ADDON, ns = ...
@@ -33,8 +33,8 @@ local Range = ns.Range
 -- ============================================================================
 -- FRIENDLY RANGE SPELLS
 -- ----------------------------------------------------------------------------
--- These are used only for classes/specs that should use real spell range for
--- friendly units. We pick the first spell the player actually knows.
+-- These are the only classes/specs that get real friendly spell range checks.
+-- We select the first spell the player actually knows.
 -- ============================================================================
 local CLASS_FRIENDLY = {
     PRIEST  = { 2061, 2050, 17 },
@@ -49,30 +49,29 @@ local CLASS_FRIENDLY = {
 -- ============================================================================
 -- API REFERENCES
 -- ----------------------------------------------------------------------------
--- Localized for slightly lower overhead and cleaner access.
+-- Localized for slightly lower overhead and cleaner code.
 -- ============================================================================
 local C_Spell_IsSpellInRange = C_Spell and C_Spell.IsSpellInRange
 
-local UnitExists            = UnitExists
-local UnitClass             = UnitClass
-local UnitIsConnected       = UnitIsConnected
-local UnitIsDeadOrGhost     = UnitIsDeadOrGhost
-local CheckInteractDistance = CheckInteractDistance
-local IsPlayerSpell         = IsPlayerSpell
-local pcall                 = pcall
+local UnitExists        = UnitExists
+local UnitClass         = UnitClass
+local UnitIsConnected   = UnitIsConnected
+local UnitIsDeadOrGhost = UnitIsDeadOrGhost
+local IsPlayerSpell     = IsPlayerSpell
+local pcall             = pcall
 
 local ipairs   = ipairs
 local math_abs = math.abs
 local type     = type
 local tonumber = tonumber
 
--- Active friendly spell selected for the player's class/spec.
+-- Active spell used for friendly range checks.
 local friendlySpellID
 
 -- ============================================================================
 -- SAFE NUMERIC HELPERS
 -- ----------------------------------------------------------------------------
--- Protect against bad DB values and keep alpha/smoothing sane.
+-- Sanitizes DB values so alpha/smoothing/update stay valid.
 -- ============================================================================
 local function Clamp01(x)
     if x < 0 then return 0 end
@@ -115,7 +114,7 @@ end
 -- ============================================================================
 -- DB ACCESS
 -- ----------------------------------------------------------------------------
--- Reads the range DB once per tick in the driver.
+-- Reads the range DB.
 -- ============================================================================
 local function GetRangeDB()
     return ns.GetRangeDB and ns:GetRangeDB() or nil
@@ -124,7 +123,7 @@ end
 -- ============================================================================
 -- SPELL PICKING
 -- ----------------------------------------------------------------------------
--- Chooses the first known spell from the class list.
+-- Picks the first known spell from the class list.
 -- ============================================================================
 local function PickSpell(list)
     if not list then return nil end
@@ -142,7 +141,7 @@ end
 -- ============================================================================
 -- SPELL REFRESH
 -- ----------------------------------------------------------------------------
--- Re-run this on login / talent change / spec change / spells changed.
+-- Updates active spell when login/spec/talents/spellbook change.
 -- ============================================================================
 local function RefreshSpells()
     local _, class = UnitClass("player")
@@ -152,13 +151,12 @@ end
 -- ============================================================================
 -- SECRET BOOLEAN SANITIZER
 -- ----------------------------------------------------------------------------
--- Midnight can taint booleans returned from APIs.
--- Never do: if v then ...
--- unless wrapped safely.
+-- WoW Midnight can return secret booleans.
+-- We never directly test range API results.
 --
 -- Returns:
 --   true / false = safe plain boolean
---   nil          = could not safely read it
+--   nil          = could not safely evaluate
 -- ============================================================================
 local function ToPlainBool(v)
     local ok, r = pcall(function()
@@ -178,7 +176,8 @@ end
 -- ============================================================================
 -- SAFE SPELL RANGE
 -- ----------------------------------------------------------------------------
--- Uses C_Spell.IsSpellInRange in a Midnight-safe way.
+-- Safe wrapper for C_Spell.IsSpellInRange.
+-- If the value is secret/unusable, returns nil.
 -- ============================================================================
 local function SafeSpellRange(spellID, unit)
     if not C_Spell_IsSpellInRange or not spellID or not unit then
@@ -194,43 +193,20 @@ local function SafeSpellRange(spellID, unit)
 end
 
 -- ============================================================================
--- SAFE INTERACT FALLBACK
--- ----------------------------------------------------------------------------
--- Used only for classes that do not have a friendly spell range option.
--- This is cheaper and less precise than spell range, but good enough as a
--- fallback for non-healer classes on party/raid frames.
--- ============================================================================
-local function SafeInteractRange(unit)
-    if not CheckInteractDistance or not unit then
-        return nil
-    end
-
-    local ok, r = pcall(CheckInteractDistance, unit, 4)
-    if not ok then
-        return nil
-    end
-
-    if type(r) == "boolean" then
-        return r
-    end
-
-    return ToPlainBool(r)
-end
-
--- ============================================================================
 -- RAW RANGE RESULT
 -- ----------------------------------------------------------------------------
--- Friendly-only logic, because this file is for Party/Raid frames.
+-- Friendly-only logic for party/raid frames.
 --
 -- Rules:
---   • Dead/offline/missing units are treated as out of range (false)
---   • If class has a friendly spell range, use only that
---   • Otherwise use interact fallback
+--   • Missing/dead/offline units are treated as out of range
+--   • If we have a friendly spell, use spell range
+--   • If we do not have a friendly spell, return nil
+--     (keep the current latched state instead of risking bad API usage)
 --
 -- Returns:
 --   true  = in range
 --   false = out of range
---   nil   = unknown (keep existing latched state)
+--   nil   = unknown / unsupported
 -- ============================================================================
 local function RawRangeResult(unit)
     if not unit or not UnitExists(unit) then
@@ -249,13 +225,13 @@ local function RawRangeResult(unit)
         return SafeSpellRange(friendlySpellID, unit)
     end
 
-    return SafeInteractRange(unit)
+    return nil
 end
 
 -- ============================================================================
 -- ALPHA TARGET CACHE
 -- ----------------------------------------------------------------------------
--- We only fade the regions we care about instead of touching the full frame.
+-- We fade only the regions we actually want to dim.
 -- Cached once per frame.
 -- ============================================================================
 local function CacheAlphaTargets(frame)
@@ -304,7 +280,7 @@ end
 -- ============================================================================
 -- FRAME STATE INIT
 -- ----------------------------------------------------------------------------
--- Initializes the fading state for a frame the first time it is processed.
+-- Initializes fading state for a frame the first time it is processed.
 -- ============================================================================
 local function InitFrameState(frame, ain)
     if frame._rangeIn == nil then
@@ -321,13 +297,12 @@ end
 -- ============================================================================
 -- RANGE APPLY
 -- ----------------------------------------------------------------------------
--- Main per-frame logic.
+-- Main per-frame update.
 --
--- CPU notes:
---   • Early-out if disabled
---   • Early-out for dead/offline already happens inside RawRangeResult
---   • If result is nil, keep current latched state
---   • Smoothing prevents blink / snapping
+-- Notes:
+--   • If range is unsupported for this class/spec, result stays latched
+--   • Dead/offline units become faded
+--   • Smooth transition prevents blinking
 -- ============================================================================
 function Range:Apply(frame, unit, dt, enabled, ain, aout, smoothing)
     if not frame or not unit then return end
@@ -363,7 +338,6 @@ function Range:Apply(frame, unit, dt, enabled, ain, aout, smoothing)
     local target = frame._rangeIn and ain or aout
     local cur = SafeAlpha(frame._rangeAlpha, target)
 
-    -- Already at target and not animating -> nothing to do.
     if not frame._rangeAnimating and math_abs(cur - target) < 0.01 then
         return
     end
@@ -389,8 +363,8 @@ end
 -- ============================================================================
 -- DRIVER STATE
 -- ----------------------------------------------------------------------------
--- Round-robin update state.
--- MAX_CHECKS_PER_TICK is the main CPU budget knob.
+-- Budgeted round-robin update state.
+-- MAX_CHECKS_PER_TICK is the main CPU tuning knob.
 -- ============================================================================
 local acc = 0
 local currentUpdateRate = 0.20
@@ -404,7 +378,7 @@ local f = CreateFrame("Frame")
 -- ============================================================================
 -- EVENTS
 -- ----------------------------------------------------------------------------
--- Only refresh spell selection when the player's spellbook/spec changes.
+-- Refresh known range spell when player setup changes.
 -- ============================================================================
 f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("SPELLS_CHANGED")
@@ -416,11 +390,6 @@ f:SetScript("OnEvent", RefreshSpells)
 -- FRAME PROCESSOR
 -- ----------------------------------------------------------------------------
 -- Processes only a limited number of visible frames each tick.
---
--- CPU optimizations:
---   • Skip nil frames
---   • Skip frames with no unit
---   • Skip hidden frames
 -- ============================================================================
 local function ProcessFrames(list, startIndex, checksLeft, tickTime, enabled, ain, aout, smoothing)
     if not list or checksLeft <= 0 then
@@ -454,12 +423,12 @@ end
 -- ============================================================================
 -- MAIN UPDATE LOOP
 -- ----------------------------------------------------------------------------
--- Runs every frame, but only performs work when enough time has accumulated.
+-- Runs on accumulated time, not every raw frame.
 --
 -- Per tick:
 --   • Read DB once
 --   • Sanitize settings once
---   • Process Party first, then Raid, under a shared budget
+--   • Process Party first, then Raid, under shared CPU budget
 -- ============================================================================
 f:SetScript("OnUpdate", function(_, dt)
     acc = acc + (dt or 0)
