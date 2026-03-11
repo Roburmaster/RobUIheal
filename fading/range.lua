@@ -1,29 +1,22 @@
 -- ============================================================================
--- range.lua (RobHeal)
+-- range.lua (RobUIHeal)
 --
--- Purpose
--- -------
--- Handles range-based fading for Party and Raid frames only.
+-- Goal
+-- ----
+-- Party/Raid range fading that works in WoW Midnight.
 --
--- Important
--- ---------
--- This file must stay combat-safe in WoW Midnight.
+-- Rules
+-- -----
+-- 1) Classes with a friendly spell use spell range.
+-- 2) Classes without a friendly spell use UnitInRange.
+-- 3) Secret booleans are NEVER tested in Lua.
+-- 4) Secret booleans are passed directly to SetAlphaFromBoolean.
+-- 5) Dead/offline/missing units use plain SetAlpha.
 --
--- Safe design:
---   • No hostile checks
---   • No CheckInteractDistance
---   • No UnitInRange
---   • No item-based fallback
---
--- Reason:
---   • CheckInteractDistance caused ADDON_ACTION_BLOCKED
---   • UnitInRange / spell APIs may return secret booleans
---   • We only use spell range where it is actually available
---
--- Final rule set:
---   • Classes with friendly spell range use spell range
---   • Classes without friendly spell range do not force fallback here
---   • Unknown result keeps previous latched state
+-- Notes
+-- -----
+-- This version removes latching/smoothing logic to avoid "stuck out of range"
+-- behavior. Each tick applies the current state directly.
 -- ============================================================================
 
 local ADDON, ns = ...
@@ -31,10 +24,9 @@ ns.Range = ns.Range or {}
 local Range = ns.Range
 
 -- ============================================================================
--- FRIENDLY RANGE SPELLS
+-- FRIENDLY SPELL RANGE TABLE
 -- ----------------------------------------------------------------------------
--- These are the only classes/specs that get real friendly spell range checks.
--- We select the first spell the player actually knows.
+-- We pick the first spell the player actually knows.
 -- ============================================================================
 local CLASS_FRIENDLY = {
     PRIEST  = { 2061, 2050, 17 },
@@ -47,31 +39,30 @@ local CLASS_FRIENDLY = {
 }
 
 -- ============================================================================
--- API REFERENCES
--- ----------------------------------------------------------------------------
--- Localized for slightly lower overhead and cleaner code.
+-- API UPVALUES
 -- ============================================================================
 local C_Spell_IsSpellInRange = C_Spell and C_Spell.IsSpellInRange
 
-local UnitExists        = UnitExists
-local UnitClass         = UnitClass
-local UnitIsConnected   = UnitIsConnected
-local UnitIsDeadOrGhost = UnitIsDeadOrGhost
-local IsPlayerSpell     = IsPlayerSpell
-local pcall             = pcall
+local UnitInRange        = UnitInRange
+local UnitExists         = UnitExists
+local UnitClass          = UnitClass
+local UnitIsUnit         = UnitIsUnit
+local UnitIsConnected    = UnitIsConnected
+local UnitIsDeadOrGhost  = UnitIsDeadOrGhost
+local IsInGroup          = IsInGroup
+local IsInRaid           = IsInRaid
+local IsPlayerSpell      = IsPlayerSpell
+local CreateFrame        = CreateFrame
 
-local ipairs   = ipairs
-local math_abs = math.abs
 local type     = type
 local tonumber = tonumber
+local ipairs   = ipairs
+local pcall    = pcall
 
--- Active spell used for friendly range checks.
 local friendlySpellID
 
 -- ============================================================================
--- SAFE NUMERIC HELPERS
--- ----------------------------------------------------------------------------
--- Sanitizes DB values so alpha/smoothing/update stay valid.
+-- SAFE DB HELPERS
 -- ============================================================================
 local function Clamp01(x)
     if x < 0 then return 0 end
@@ -81,7 +72,7 @@ end
 
 local function SafeNumber(v, fallback)
     if type(v) == "number" then
-        if v ~= v then return fallback end -- NaN
+        if v ~= v then return fallback end
         return v
     end
 
@@ -104,30 +95,17 @@ local function SafeUpdateRate(v)
     return n
 end
 
-local function SafeSmoothing(v)
-    local n = SafeNumber(v, 10)
-    if n < 1 then n = 1 end
-    if n > 60 then n = 60 end
-    return n
-end
-
--- ============================================================================
--- DB ACCESS
--- ----------------------------------------------------------------------------
--- Reads the range DB.
--- ============================================================================
 local function GetRangeDB()
     return ns.GetRangeDB and ns:GetRangeDB() or nil
 end
 
 -- ============================================================================
 -- SPELL PICKING
--- ----------------------------------------------------------------------------
--- Picks the first known spell from the class list.
 -- ============================================================================
 local function PickSpell(list)
-    if not list then return nil end
-    if not IsPlayerSpell then return nil end
+    if not list or not IsPlayerSpell then
+        return nil
+    end
 
     for _, id in ipairs(list) do
         if IsPlayerSpell(id) then
@@ -138,34 +116,113 @@ local function PickSpell(list)
     return nil
 end
 
--- ============================================================================
--- SPELL REFRESH
--- ----------------------------------------------------------------------------
--- Updates active spell when login/spec/talents/spellbook change.
--- ============================================================================
 local function RefreshSpells()
     local _, class = UnitClass("player")
     friendlySpellID = PickSpell(CLASS_FRIENDLY[class])
 end
 
 -- ============================================================================
--- SECRET BOOLEAN SANITIZER
+-- TARGET CACHE
 -- ----------------------------------------------------------------------------
--- WoW Midnight can return secret booleans.
--- We never directly test range API results.
---
--- Returns:
---   true / false = safe plain boolean
---   nil          = could not safely evaluate
+-- Prefer holder/container if available.
+-- Otherwise use known visual elements.
 -- ============================================================================
-local function ToPlainBool(v)
-    local ok, r = pcall(function()
-        if v then
-            return true
-        end
-        return false
-    end)
+local function CacheTargets(frame)
+    if frame._rangeTargets then
+        return frame._rangeTargets
+    end
 
+    local t = {}
+
+    if frame.rangeHolder and frame.rangeHolder.SetAlphaFromBoolean then
+        t[#t+1] = frame.rangeHolder
+    elseif frame.holder and frame.holder.SetAlphaFromBoolean then
+        t[#t+1] = frame.holder
+    elseif frame.container and frame.container.SetAlphaFromBoolean then
+        t[#t+1] = frame.container
+    else
+        if frame.bg and frame.bg.SetAlpha then t[#t+1] = frame.bg end
+        if frame.hp and frame.hp.SetAlpha then t[#t+1] = frame.hp end
+        if frame.hpbg and frame.hpbg.SetAlpha then t[#t+1] = frame.hpbg end
+        if frame.power and frame.power.SetAlpha then t[#t+1] = frame.power end
+        if frame.nameText and frame.nameText.SetAlpha then t[#t+1] = frame.nameText end
+        if frame.roleText and frame.roleText.SetAlpha then t[#t+1] = frame.roleText end
+
+        if #t == 0 and frame.SetAlpha then
+            t[#t+1] = frame
+        end
+    end
+
+    frame._rangeTargets = t
+    return t
+end
+
+-- ============================================================================
+-- PLAIN ALPHA
+-- ----------------------------------------------------------------------------
+-- Used only for normal, non-secret states:
+--   missing / dead / offline / self / no-group
+-- ============================================================================
+local function ApplyPlainAlpha(frame, alpha)
+    if not frame then return end
+    alpha = SafeAlpha(alpha, 1.0)
+
+    local targets = CacheTargets(frame)
+    if not targets then return end
+
+    for i = 1, #targets do
+        local obj = targets[i]
+        if obj and obj.SetAlpha then
+            obj:SetAlpha(alpha)
+        end
+    end
+end
+
+-- ============================================================================
+-- SECRET ALPHA
+-- ----------------------------------------------------------------------------
+-- Passes secret boolean directly to SetAlphaFromBoolean.
+-- Never inspect the value in Lua.
+-- If an object lacks SetAlphaFromBoolean, it is skipped.
+-- ============================================================================
+local function ApplySecretAlpha(frame, secretValue, alphaIn, alphaOut)
+    if not frame then return end
+
+    alphaIn = SafeAlpha(alphaIn, 1.0)
+    alphaOut = SafeAlpha(alphaOut, 0.5)
+
+    local targets = CacheTargets(frame)
+    if not targets then return end
+
+    for i = 1, #targets do
+        local obj = targets[i]
+        if obj and obj.SetAlphaFromBoolean then
+            obj:SetAlphaFromBoolean(secretValue, alphaIn, alphaOut)
+        end
+    end
+end
+
+-- ============================================================================
+-- SECRET RANGE SOURCES
+-- ----------------------------------------------------------------------------
+-- Classes with friendly spell:
+--   use spell range
+--
+-- Classes without friendly spell:
+--   use UnitInRange
+--
+-- Return value is opaque/secret and must NOT be tested in Lua.
+-- ============================================================================
+local function GetSecretRangeValue(unit)
+    if friendlySpellID and C_Spell_IsSpellInRange then
+        local ok, r = pcall(C_Spell_IsSpellInRange, friendlySpellID, unit)
+        if ok then
+            return r
+        end
+        return nil
+    end
+
+    local ok, r = pcall(UnitInRange, unit)
     if ok then
         return r
     end
@@ -174,294 +231,224 @@ local function ToPlainBool(v)
 end
 
 -- ============================================================================
--- SAFE SPELL RANGE
+-- MAIN FRAME UPDATE
 -- ----------------------------------------------------------------------------
--- Safe wrapper for C_Spell.IsSpellInRange.
--- If the value is secret/unusable, returns nil.
--- ============================================================================
-local function SafeSpellRange(spellID, unit)
-    if not C_Spell_IsSpellInRange or not spellID or not unit then
-        return nil
-    end
-
-    local ok, r = pcall(C_Spell_IsSpellInRange, spellID, unit)
-    if not ok then
-        return nil
-    end
-
-    return ToPlainBool(r)
-end
-
--- ============================================================================
--- RAW RANGE RESULT
--- ----------------------------------------------------------------------------
--- Friendly-only logic for party/raid frames.
+-- Plain states:
+--   missing/dead/offline  -> out alpha
+--   self                  -> in alpha
+--   not in group/raid     -> in alpha
 --
--- Rules:
---   • Missing/dead/offline units are treated as out of range
---   • If we have a friendly spell, use spell range
---   • If we do not have a friendly spell, return nil
---     (keep the current latched state instead of risking bad API usage)
---
--- Returns:
---   true  = in range
---   false = out of range
---   nil   = unknown / unsupported
+-- Secret state:
+--   use spell range or UnitInRange directly
 -- ============================================================================
-local function RawRangeResult(unit)
-    if not unit or not UnitExists(unit) then
-        return false
+function Range:UpdateFrame(frame, alphaIn, alphaOut)
+    if not frame or not frame.unit then return end
+    if frame.IsShown and not frame:IsShown() then return end
+
+    alphaIn = SafeAlpha(alphaIn, 1.0)
+    alphaOut = SafeAlpha(alphaOut, 0.5)
+
+    local unit = frame.unit
+
+    if not UnitExists(unit) then
+        ApplyPlainAlpha(frame, alphaOut)
+        return
     end
 
     if UnitIsDeadOrGhost and UnitIsDeadOrGhost(unit) then
-        return false
+        ApplyPlainAlpha(frame, alphaOut)
+        return
     end
 
     if UnitIsConnected and not UnitIsConnected(unit) then
-        return false
-    end
-
-    if friendlySpellID then
-        return SafeSpellRange(friendlySpellID, unit)
-    end
-
-    return nil
-end
-
--- ============================================================================
--- ALPHA TARGET CACHE
--- ----------------------------------------------------------------------------
--- We fade only the regions we actually want to dim.
--- Cached once per frame.
--- ============================================================================
-local function CacheAlphaTargets(frame)
-    if frame._rangeTargets then return end
-
-    local t = {}
-
-    if frame.bg then t[#t+1] = frame.bg end
-    if frame.hp then t[#t+1] = frame.hp end
-    if frame.hpbg then t[#t+1] = frame.hpbg end
-    if frame.power then t[#t+1] = frame.power end
-    if frame.nameText then t[#t+1] = frame.nameText end
-    if frame.roleText then t[#t+1] = frame.roleText end
-
-    frame._rangeTargets = t
-end
-
--- ============================================================================
--- APPLY ALPHA
--- ----------------------------------------------------------------------------
--- Avoids reapplying alpha if the value barely changed.
--- ============================================================================
-local function ApplyAlpha(frame, a)
-    if not frame then return end
-
-    a = SafeAlpha(a, 1.0)
-
-    local last = frame._rangeLastApplied
-    if last and math_abs(last - a) < 0.01 then
-        return
-    end
-    frame._rangeLastApplied = a
-
-    CacheAlphaTargets(frame)
-    local targets = frame._rangeTargets
-    if not targets then return end
-
-    for i = 1, #targets do
-        local obj = targets[i]
-        if obj and obj.SetAlpha then
-            obj:SetAlpha(a)
-        end
-    end
-end
-
--- ============================================================================
--- FRAME STATE INIT
--- ----------------------------------------------------------------------------
--- Initializes fading state for a frame the first time it is processed.
--- ============================================================================
-local function InitFrameState(frame, ain)
-    if frame._rangeIn == nil then
-        local safeIn = SafeAlpha(ain, 1.0)
-
-        frame._rangeIn = true
-        frame._rangeAlpha = safeIn
-        frame._rangeLastApplied = nil
-        frame._rangeAnimating = false
-        frame._rangeTargets = nil
-    end
-end
-
--- ============================================================================
--- RANGE APPLY
--- ----------------------------------------------------------------------------
--- Main per-frame update.
---
--- Notes:
---   • If range is unsupported for this class/spec, result stays latched
---   • Dead/offline units become faded
---   • Smooth transition prevents blinking
--- ============================================================================
-function Range:Apply(frame, unit, dt, enabled, ain, aout, smoothing)
-    if not frame or not unit then return end
-
-    ain = SafeAlpha(ain, 1.0)
-    aout = SafeAlpha(aout, 0.5)
-    smoothing = SafeSmoothing(smoothing)
-
-    InitFrameState(frame, ain)
-
-    if not enabled then
-        frame._rangeIn = true
-        frame._rangeAlpha = ain
-        frame._rangeAnimating = false
-        ApplyAlpha(frame, ain)
+        ApplyPlainAlpha(frame, alphaOut)
         return
     end
 
-    local r = RawRangeResult(unit)
-
-    if r == false then
-        if frame._rangeIn ~= false then
-            frame._rangeIn = false
-            frame._rangeAnimating = true
-        end
-    elseif r == true then
-        if frame._rangeIn ~= true then
-            frame._rangeIn = true
-            frame._rangeAnimating = true
-        end
-    end
-
-    local target = frame._rangeIn and ain or aout
-    local cur = SafeAlpha(frame._rangeAlpha, target)
-
-    if not frame._rangeAnimating and math_abs(cur - target) < 0.01 then
+    if UnitIsUnit and UnitIsUnit(unit, "player") then
+        ApplyPlainAlpha(frame, alphaIn)
         return
     end
 
-    local step = (dt or 0.2) * smoothing
-    if step > 1 then step = 1 end
-    if step < 0 then step = 0 end
-
-    local nextA = cur + (target - cur) * step
-    nextA = SafeAlpha(nextA, target)
-    frame._rangeAlpha = nextA
-
-    if math_abs(nextA - target) < 0.01 then
-        frame._rangeAlpha = target
-        frame._rangeAnimating = false
-        ApplyAlpha(frame, target)
+    if not (IsInGroup() or IsInRaid()) then
+        ApplyPlainAlpha(frame, alphaIn)
         return
     end
 
-    ApplyAlpha(frame, nextA)
+    local secretRange = GetSecretRangeValue(unit)
+
+    -- Do not test secretRange in Lua.
+    -- Pass it directly to the engine helper.
+    if secretRange ~= nil then
+        ApplySecretAlpha(frame, secretRange, alphaIn, alphaOut)
+    else
+        -- If range API failed, prefer visible over stuck faded.
+        ApplyPlainAlpha(frame, alphaIn)
+    end
 end
 
 -- ============================================================================
--- DRIVER STATE
+-- PET FRAME UPDATE
 -- ----------------------------------------------------------------------------
--- Budgeted round-robin update state.
--- MAX_CHECKS_PER_TICK is the main CPU tuning knob.
+-- Pets inherit owner range.
 -- ============================================================================
-local acc = 0
-local currentUpdateRate = 0.20
-local MAX_CHECKS_PER_TICK = 10
+function Range:UpdatePetFrame(frame, alphaIn, alphaOut)
+    if not frame or not frame.unit then return end
+    if frame.IsShown and not frame:IsShown() then return end
 
-local partyIndex = 1
-local raidIndex  = 1
-
-local f = CreateFrame("Frame")
-
--- ============================================================================
--- EVENTS
--- ----------------------------------------------------------------------------
--- Refresh known range spell when player setup changes.
--- ============================================================================
-f:RegisterEvent("PLAYER_LOGIN")
-f:RegisterEvent("SPELLS_CHANGED")
-f:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
-f:RegisterEvent("PLAYER_TALENT_UPDATE")
-f:SetScript("OnEvent", RefreshSpells)
-
--- ============================================================================
--- FRAME PROCESSOR
--- ----------------------------------------------------------------------------
--- Processes only a limited number of visible frames each tick.
--- ============================================================================
-local function ProcessFrames(list, startIndex, checksLeft, tickTime, enabled, ain, aout, smoothing)
-    if not list or checksLeft <= 0 then
-        return startIndex, checksLeft
+    if not UnitExists(frame.unit) then
+        ApplyPlainAlpha(frame, alphaOut)
+        return
     end
 
-    local n = #list
-    if n < 1 then
-        return 1, checksLeft
+    local ownerUnit = frame.ownerUnit
+    if not ownerUnit then
+        ApplyPlainAlpha(frame, alphaIn)
+        return
     end
 
-    local i = startIndex
-    local loops = 0
+    alphaIn = SafeAlpha(alphaIn, 1.0)
+    alphaOut = SafeAlpha(alphaOut, 0.5)
 
-    while checksLeft > 0 and loops < n do
-        local frame = list[i]
-
-        if frame and frame.unit and frame.IsShown and frame:IsShown() then
-            Range:Apply(frame, frame.unit, tickTime, enabled, ain, aout, smoothing)
-            checksLeft = checksLeft - 1
-        end
-
-        i = i + 1
-        if i > n then i = 1 end
-        loops = loops + 1
+    if not UnitExists(ownerUnit) then
+        ApplyPlainAlpha(frame, alphaOut)
+        return
     end
 
-    return i, checksLeft
+    if UnitIsDeadOrGhost and UnitIsDeadOrGhost(ownerUnit) then
+        ApplyPlainAlpha(frame, alphaOut)
+        return
+    end
+
+    if UnitIsConnected and not UnitIsConnected(ownerUnit) then
+        ApplyPlainAlpha(frame, alphaOut)
+        return
+    end
+
+    if UnitIsUnit and UnitIsUnit(ownerUnit, "player") then
+        ApplyPlainAlpha(frame, alphaIn)
+        return
+    end
+
+    if not (IsInGroup() or IsInRaid()) then
+        ApplyPlainAlpha(frame, alphaIn)
+        return
+    end
+
+    local secretRange = GetSecretRangeValue(ownerUnit)
+
+    if secretRange ~= nil then
+        ApplySecretAlpha(frame, secretRange, alphaIn, alphaOut)
+    else
+        ApplyPlainAlpha(frame, alphaIn)
+    end
 end
 
 -- ============================================================================
--- MAIN UPDATE LOOP
+-- DRIVER
 -- ----------------------------------------------------------------------------
--- Runs on accumulated time, not every raw frame.
---
--- Per tick:
---   • Read DB once
---   • Sanitize settings once
---   • Process Party first, then Raid, under shared CPU budget
+-- Simple ticker. No latching, no smoothing.
 -- ============================================================================
-f:SetScript("OnUpdate", function(_, dt)
-    acc = acc + (dt or 0)
-    if acc < currentUpdateRate then return end
+local tickerFrame = CreateFrame("Frame")
+local tickerGroup = tickerFrame:CreateAnimationGroup()
+local tickerAnim = tickerGroup:CreateAnimation()
+tickerAnim:SetDuration(0.20)
+tickerGroup:SetLooping("REPEAT")
 
-    local tickTime = acc
-    acc = 0
-
+tickerGroup:SetScript("OnLoop", function()
     local rdb = GetRangeDB()
     local enabled = (rdb == nil) and true or (rdb.enabled ~= false)
-
-    currentUpdateRate = SafeUpdateRate(rdb and rdb.update)
-
     if not enabled then
         return
     end
 
-    local ain = SafeAlpha(rdb and rdb.alphaIn, 1.0)
-    local aout = SafeAlpha(rdb and rdb.alphaOut, 0.5)
-    local smoothing = SafeSmoothing(rdb and rdb.smoothing)
+    local rate = SafeUpdateRate(rdb and rdb.update)
+    if tickerAnim:GetDuration() ~= rate then
+        tickerAnim:SetDuration(rate)
+    end
 
-    local checksLeft = MAX_CHECKS_PER_TICK
+    local alphaIn = SafeAlpha(rdb and rdb.alphaIn, 1.0)
+    local alphaOut = SafeAlpha(rdb and rdb.alphaOut, 0.5)
 
+    -- Party
     local partyFrames = ns.Party and ns.Party.frames
-    partyIndex, checksLeft = ProcessFrames(
-        partyFrames, partyIndex, checksLeft, tickTime, enabled, ain, aout, smoothing
-    )
+    if partyFrames then
+        for i = 1, #partyFrames do
+            local frame = partyFrames[i]
+            if frame and frame.IsShown and frame:IsShown() then
+                Range:UpdateFrame(frame, alphaIn, alphaOut)
+            end
+        end
+    end
 
+    -- Raid
     local raidFrames = ns.Raid and ns.Raid.frames
-    raidIndex, checksLeft = ProcessFrames(
-        raidFrames, raidIndex, checksLeft, tickTime, enabled, ain, aout, smoothing
-    )
+    if raidFrames then
+        for i = 1, #raidFrames do
+            local frame = raidFrames[i]
+            if frame and frame.IsShown and frame:IsShown() then
+                Range:UpdateFrame(frame, alphaIn, alphaOut)
+            end
+        end
+    end
+
+    -- Player pet
+    if ns.Pet and ns.Pet.playerFrame and ns.Pet.playerFrame.IsShown and ns.Pet.playerFrame:IsShown() then
+        Range:UpdatePetFrame(ns.Pet.playerFrame, alphaIn, alphaOut)
+    end
+
+    -- Party pets
+    local partyPetFrames = ns.Pet and ns.Pet.partyFrames
+    if partyPetFrames then
+        for i = 1, #partyPetFrames do
+            local frame = partyPetFrames[i]
+            if frame and frame.IsShown and frame:IsShown() then
+                Range:UpdatePetFrame(frame, alphaIn, alphaOut)
+            end
+        end
+    end
+
+    -- Raid pets
+    local raidPetFrames = ns.Pet and ns.Pet.raidFrames
+    if raidPetFrames then
+        for i = 1, #raidPetFrames do
+            local frame = raidPetFrames[i]
+            if frame and frame.IsShown and frame:IsShown() then
+                Range:UpdatePetFrame(frame, alphaIn, alphaOut)
+            end
+        end
+    end
 end)
 
--- Initial spell setup on load.
-RefreshSpells()
+function Range:Start()
+    if not tickerGroup:IsPlaying() then
+        local rdb = GetRangeDB()
+        tickerAnim:SetDuration(SafeUpdateRate(rdb and rdb.update))
+        tickerGroup:Play()
+    end
+end
+
+function Range:Stop()
+    if tickerGroup:IsPlaying() then
+        tickerGroup:Stop()
+    end
+end
+
+function Range:RefreshRate()
+    local rdb = GetRangeDB()
+    local rate = SafeUpdateRate(rdb and rdb.update)
+    tickerAnim:SetDuration(rate)
+
+    if tickerGroup:IsPlaying() then
+        tickerGroup:Stop()
+        tickerGroup:Play()
+    end
+end
+
+local starter = CreateFrame("Frame")
+starter:RegisterEvent("PLAYER_LOGIN")
+starter:SetScript("OnEvent", function(self)
+    self:UnregisterAllEvents()
+    RefreshSpells()
+    Range:Start()
+end)
