@@ -1,5 +1,5 @@
 -- ============================================================================
--- party.lua (RobHeal)
+-- party.lua (RobHeal) v1
 -- Party frames (no SecureHeader). Uses db.lua: ns:GetPartyDB() (role-profile aware).
 -- ============================================================================
 
