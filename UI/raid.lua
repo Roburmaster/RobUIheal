@@ -1,19 +1,26 @@
 -- ============================================================================
 -- raid.lua (RobHeal)
--- Raid frames (no SecureHeader). Uses db.lua: ns:GetRaidDB() (role-profile aware).
+-- Raid frames (stable unit-token model for secure click-casting).
+-- Uses db.lua: ns:GetRaidDB() (role-profile aware).
+--
+-- IMPORTANT FIX:
+--  - Frames are now permanently tied to fixed unit tokens: raid1..raid40
+--  - Sorting/layout only changes VISUAL POSITION, never which unit token a frame owns
+--  - This keeps RobHeal secure overlays stable and fixes raid click-healing
 --
 -- UPDATED:
---  - Real raid now respects:
+--  - Real raid respects:
 --      * db.orientation
 --      * db.columns
 --      * db.groupGap
 --      * db.spacing
---  - Shared layout engine added:
+--  - Shared layout engine:
 --      * Raid:ComputeLayout(entries)
---    This is the layout function sim + real should use.
+--  - Sim/settings mode supported:
+--      * entries without .unit no longer break layout
 --
 -- BEHAVIOR:
---  - allowDrag support (like Party)
+--  - allowDrag support
 --  - mover visibility honors allowDrag + locked + combat
 --  - selection, targeted square, incoming heals, dispels, debuffs preserved
 --
@@ -39,17 +46,23 @@ local TEX     = "Interface\\Buttons\\WHITE8X8"
 local POWER_H = 3
 local NAME_H  = 14
 local NAME_MAX_CHARS = 10
+local MAX_RAID_UNITS = 40
 
 Raid.frames       = Raid.frames or {}
+Raid.framesByUnit = Raid.framesByUnit or {}
 Raid.eventFrame   = Raid.eventFrame or nil
 Raid.mover        = Raid.mover or nil
 Raid.selectedUnit = Raid.selectedUnit or nil
 
-local max   = math.max
-local min   = math.min
-local floor = math.floor
-local tinsert = table.insert
-local tsort   = table.sort
+local max      = math.max
+local floor    = math.floor
+local tinsert  = table.insert
+local tsort    = table.sort
+local ipairs   = ipairs
+local pairs    = pairs
+local tostring = tostring
+local tonumber = tonumber
+local type     = type
 
 local function GetDB()
     return ns:GetRaidDB()
@@ -293,6 +306,7 @@ function Raid:HookOverlayClicks(host, overlay)
     overlay:HookScript("OnClick", function(self, mouseButton)
         if mouseButton ~= "LeftButton" then return end
         if not IsShiftKeyDown() then return end
+
         local unit = self:GetAttribute("unit") or (host and host.unit)
         if unit and unit ~= "" then
             Raid:SetSelectedUnit(unit)
@@ -352,19 +366,22 @@ local function ApplyMoverPosition(m)
     m:SetPoint(db.point or "CENTER", UIParent, db.relPoint or "CENTER", db.x or 0, db.y or 120)
 end
 
-local function CreateUnitButton()
+local function CreateUnitButton(stableUnit)
     local btn = CreateFrame("Button", nil, UIParent)
     btn:SetClampedToScreen(true)
     btn:RegisterForClicks("AnyUp", "AnyDown")
+
+    btn.unit = stableUnit
+    btn._stableUnit = stableUnit
 
     btn.bg = btn:CreateTexture(nil, "BACKGROUND")
     btn.bg:SetAllPoints()
     btn.bg:SetColorTexture(0.06, 0.06, 0.06, 0.85)
 
-    btn.btop = btn:CreateTexture(nil, "BORDER"); btn.btop:SetColorTexture(0,0,0,0.85)
-    btn.bbot = btn:CreateTexture(nil, "BORDER"); btn.bbot:SetColorTexture(0,0,0,0.85)
-    btn.blef = btn:CreateTexture(nil, "BORDER"); btn.blef:SetColorTexture(0,0,0,0.85)
-    btn.brig = btn:CreateTexture(nil, "BORDER"); btn.brig:SetColorTexture(0,0,0,0.85)
+    btn.btop = btn:CreateTexture(nil, "BORDER"); btn.btop:SetColorTexture(0, 0, 0, 0.85)
+    btn.bbot = btn:CreateTexture(nil, "BORDER"); btn.bbot:SetColorTexture(0, 0, 0, 0.85)
+    btn.blef = btn:CreateTexture(nil, "BORDER"); btn.blef:SetColorTexture(0, 0, 0, 0.85)
+    btn.brig = btn:CreateTexture(nil, "BORDER"); btn.brig:SetColorTexture(0, 0, 0, 0.85)
     btn.btop:SetPoint("TOPLEFT");     btn.btop:SetPoint("TOPRIGHT");     btn.btop:SetHeight(1)
     btn.bbot:SetPoint("BOTTOMLEFT");  btn.bbot:SetPoint("BOTTOMRIGHT");  btn.bbot:SetHeight(1)
     btn.blef:SetPoint("TOPLEFT");     btn.blef:SetPoint("BOTTOMLEFT");   btn.blef:SetWidth(1)
@@ -429,8 +446,8 @@ local function CreateUnitButton()
 
     if not btn._hpPctOverlay then
         local o = CreateFrame("Frame", nil, UIParent)
-        o:SetFrameStrata("TOOLTIP")
-        o:SetFrameLevel(9999)
+        o:SetFrameStrata("MEDIUM")
+        o:SetFrameLevel(btn:GetFrameLevel() + 2)
         o:SetClampedToScreen(true)
         o:Show()
 
@@ -477,6 +494,22 @@ local function CreateUnitButton()
     return btn
 end
 
+function Raid:EnsureStableFrames()
+    for i = 1, MAX_RAID_UNITS do
+        local unit = "raid" .. i
+        local f = self.framesByUnit[unit]
+        if not f then
+            f = CreateUnitButton(unit)
+            self.framesByUnit[unit] = f
+            self.frames[#self.frames + 1] = f
+
+            if _G.RobHeal_RegisterFrame then
+                _G.RobHeal_RegisterFrame(f, unit)
+            end
+        end
+    end
+end
+
 function Raid:GetUnits()
     local db = GetDB()
     local list = {}
@@ -506,15 +539,15 @@ function Raid:GetUnits()
     return list
 end
 
-function Raid:GetLayoutEntriesFromFrames(frames)
+function Raid:GetLayoutEntriesFromUnits(units)
     local entries = {}
-    for i, f in ipairs(frames or {}) do
+    for _, unit in ipairs(units or {}) do
+        local f = self.framesByUnit[unit]
         if f then
             entries[#entries + 1] = {
-                index = i,
                 frame = f,
-                unit = f.unit,
-                subgroup = GetSubgroup(f.unit) or 1,
+                unit = unit,
+                subgroup = GetSubgroup(unit) or 1,
             }
         end
     end
@@ -635,7 +668,9 @@ function Raid:ComputeLayout(entries)
                 localY = (i - 1) * (h + spacing)
             end
 
-            positions[entry] = {
+            local key = entry.unit or entry
+
+            positions[key] = {
                 x = block.x + localX,
                 y = block.y + localY,
                 width = w,
@@ -768,14 +803,31 @@ function Raid:Apply(frame)
     self:UpdateSelectionHighlights()
 end
 
-function Raid:Layout(frames)
+function Raid:Layout(unitsOrEntries)
     local FriendlyBuffs = ns.FriendlyBuffs
-    local entries = self:GetLayoutEntriesFromFrames(frames)
+    local entries = {}
+
+    if not unitsOrEntries or #unitsOrEntries == 0 then
+        entries = {}
+    else
+        local first = unitsOrEntries[1]
+        if type(first) == "string" then
+            entries = self:GetLayoutEntriesFromUnits(unitsOrEntries)
+        else
+            entries = unitsOrEntries
+        end
+    end
+
     local layout = self:ComputeLayout(entries)
 
     for _, entry in ipairs(entries) do
         local f = entry.frame
-        local pos = layout.positions[entry]
+        if not f and entry.unit then
+            f = self.framesByUnit[entry.unit]
+        end
+
+        local key = entry.unit or entry
+        local pos = layout.positions[key]
 
         if f and pos then
             f:SetSize(pos.width, pos.height)
@@ -805,6 +857,17 @@ function Raid:Layout(frames)
     self:UpdateSelectionHighlights()
 end
 
+function Raid:HideAllFrames()
+    for _, f in ipairs(self.frames) do
+        if not InCombatLockdown() then
+            f:Hide()
+            if f._hpPctOverlay then f._hpPctOverlay:Hide() end
+        else
+            SoftHide(f)
+        end
+    end
+end
+
 function Raid:Build()
     local db = GetDB()
 
@@ -827,21 +890,11 @@ function Raid:Build()
     db.orientation = NormalizeOrientation(db.orientation)
     db.columns = NormalizeColumns(db.columns)
 
-    if not (IsInRaid and IsInRaid()) then
-        if not InCombatLockdown() then
-            for _, f in ipairs(self.frames) do
-                f:Hide()
-                if f._hpPctOverlay then f._hpPctOverlay:Hide() end
-            end
-        else
-            for _, f in ipairs(self.frames) do
-                SoftHide(f)
-            end
-        end
+    self:EnsureStableFrames()
 
-        if self.mover then
-            self.mover:Hide()
-        end
+    if not (IsInRaid and IsInRaid()) then
+        self:HideAllFrames()
+        if self.mover then self.mover:Hide() end
         return
     end
 
@@ -855,104 +908,80 @@ function Raid:Build()
     self.mover:SetShown(showMover)
 
     if not db.enabled then
-        if not InCombatLockdown() then
-            for _, f in ipairs(self.frames) do
-                f:Hide()
-                if f._hpPctOverlay then f._hpPctOverlay:Hide() end
-            end
-        else
-            for _, f in ipairs(self.frames) do
-                SoftHide(f)
-            end
-        end
+        self:HideAllFrames()
         return
     end
 
     local units = self:GetUnits()
-    local shown = {}
+    local active = {}
 
-    for i = 1, #units do
-        local f = self.frames[i]
-        if not f then
-            f = CreateUnitButton()
-            self.frames[i] = f
-        end
+    for _, unit in ipairs(units) do
+        active[unit] = true
+        local f = self.framesByUnit[unit]
+        if f then
+            f.unit = f._stableUnit or unit
 
-        f.unit = units[i]
+            if not InCombatLockdown() then
+                f:Show()
+            end
+            SoftShow(f)
 
-        f:Show()
-        SoftShow(f)
-
-        if _G.RobHeal_RegisterFrame then
-            _G.RobHeal_RegisterFrame(f, f.unit)
-        end
-
-        self:Apply(f)
-        shown[#shown + 1] = f
-    end
-
-    for i = #units + 1, #self.frames do
-        local f = self.frames[i]
-        if not InCombatLockdown() then
-            f:Hide()
-            if f._hpPctOverlay then f._hpPctOverlay:Hide() end
-        else
-            SoftHide(f)
+            self:Apply(f)
         end
     end
 
-    self:Layout(shown)
+    for unit, f in pairs(self.framesByUnit) do
+        if not active[unit] then
+            if not InCombatLockdown() then
+                f:Hide()
+                if f._hpPctOverlay then f._hpPctOverlay:Hide() end
+            else
+                SoftHide(f)
+            end
+        end
+    end
+
+    self:Layout(units)
 end
 
 function Raid:OnUnit(unit, event)
     if not unit then return end
 
+    local f = self.framesByUnit[unit]
+    if not f then return end
+    if not UnitExists(unit) then return end
+
     if event == "UNIT_AURA" then
         local FriendlyBuffs = ns.FriendlyBuffs
         local TargetedSpells = ns.TargetedSpells
 
-        for _, f in ipairs(self.frames) do
-            if f and f.unit == unit then
-                if Dispel and Dispel.Update then Dispel:Update(f, unit) end
-                if Debuffs and Debuffs.Update then Debuffs:Update(f, unit) end
-                if FriendlyBuffs and FriendlyBuffs.Update then FriendlyBuffs:Update(f, unit) end
+        if Dispel and Dispel.Update then Dispel:Update(f, unit) end
+        if Debuffs and Debuffs.Update then Debuffs:Update(f, unit) end
+        if FriendlyBuffs and FriendlyBuffs.Update then FriendlyBuffs:Update(f, unit) end
 
-                EnsureTargetedSquare(f)
-                UpdateTargetedSquare(f, unit)
+        EnsureTargetedSquare(f)
+        UpdateTargetedSquare(f, unit)
 
-                if TargetedSpells and TargetedSpells.UpdateFrame then
-                    TargetedSpells:UpdateFrame(f, unit)
-                end
-
-                self:UpdateSelectionHighlights()
-                return
-            end
+        if TargetedSpells and TargetedSpells.UpdateFrame then
+            TargetedSpells:UpdateFrame(f, unit)
         end
+
+        self:UpdateSelectionHighlights()
         return
     end
 
     if event == "UNIT_HEAL_PREDICTION" or event == "UNIT_ABSORB_AMOUNT_CHANGED" or event == "UNIT_HEAL_ABSORB_AMOUNT_CHANGED" then
-        for _, f in ipairs(self.frames) do
-            if f and f.unit == unit then
-                local cur = tonumber(UnitHealth(unit)) or 0
-                local mx  = tonumber(UnitHealthMax(unit)) or 1
-                if mx <= 0 then mx = 1 end
-                if ns.IncomingHeals and ns.IncomingHeals.Update then ns.IncomingHeals:Update(f, unit, cur, mx) end
-                if ns.HealAbsorb   and ns.HealAbsorb.Update   then ns.HealAbsorb:Update(f, unit, cur, mx) end
-                if ns.ShieldAbsorb and ns.ShieldAbsorb.Update then ns.ShieldAbsorb:Update(f, unit, cur, mx) end
-                self:UpdateSelectionHighlights()
-                return
-            end
-        end
+        local cur = tonumber(UnitHealth(unit)) or 0
+        local mx  = tonumber(UnitHealthMax(unit)) or 1
+        if mx <= 0 then mx = 1 end
+        if ns.IncomingHeals and ns.IncomingHeals.Update then ns.IncomingHeals:Update(f, unit, cur, mx) end
+        if ns.HealAbsorb   and ns.HealAbsorb.Update   then ns.HealAbsorb:Update(f, unit, cur, mx) end
+        if ns.ShieldAbsorb and ns.ShieldAbsorb.Update then ns.ShieldAbsorb:Update(f, unit, cur, mx) end
+        self:UpdateSelectionHighlights()
         return
     end
 
-    for _, f in ipairs(self.frames) do
-        if f and f.unit == unit then
-            self:Apply(f)
-            return
-        end
-    end
+    self:Apply(f)
 end
 
 function Raid:Init()
@@ -964,6 +993,9 @@ function Raid:Init()
     ef:RegisterEvent("GROUP_ROSTER_UPDATE")
     ef:RegisterEvent("PLAYER_ENTERING_WORLD")
     ef:RegisterEvent("PLAYER_ROLES_ASSIGNED")
+
+    ef:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+    ef:RegisterEvent("SPELLS_CHANGED")
 
     ef:RegisterEvent("UNIT_HEALTH")
     ef:RegisterEvent("UNIT_MAXHEALTH")
@@ -983,7 +1015,9 @@ function Raid:Init()
     ef:SetScript("OnEvent", function(_, event, unit)
         if event == "GROUP_ROSTER_UPDATE"
         or event == "PLAYER_ENTERING_WORLD"
-        or event == "PLAYER_ROLES_ASSIGNED" then
+        or event == "PLAYER_ROLES_ASSIGNED"
+        or event == "PLAYER_SPECIALIZATION_CHANGED"
+        or event == "SPELLS_CHANGED" then
             if ns.UpdateActiveProfile then ns:UpdateActiveProfile(false) end
             if ns.RequestRaidRebuild then
                 ns:RequestRaidRebuild()
@@ -1003,7 +1037,7 @@ function Raid:Init()
             end
             Raid:UpdateSelectionHighlights()
 
-        elseif unit then
+        elseif unit and tostring(unit):match("^raid%d+$") then
             Raid:OnUnit(unit, event)
         end
     end)
