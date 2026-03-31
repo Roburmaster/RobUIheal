@@ -1,12 +1,18 @@
 -- ============================================================================
 -- debuffs.lua (RobHeal) - WoW 12.0 / Midnight
--- TWO-ROW SOLUTION (WORKING DESIGN):
---   - Row 1 (TOP):   BOSS/PRIVATE AURAS via C_UnitAuras.AddPrivateAuraAnchor (bigger icons)
---   - Row 2 (BOTTOM):NORMAL debuffs via C_UnitAuras.GetAuraDataByIndex (DurationObject for swipe+countdown)
+-- TWO-ROW SOLUTION (COMBAT-SAFE / SECURE-RAID SAFE):
+--   - Row 1 (TOP):   BOSS/PRIVATE AURAS via C_UnitAuras.AddPrivateAuraAnchor
+--   - Row 2 (BOTTOM):NORMAL debuffs via C_UnitAuras.GetAuraDataByIndex
+--
+-- FIXES:
+--   - Never rebuild private aura anchors in combat
+--   - Prefer stable raid token (frame._stableUnit) for private anchors
+--   - Private anchors are treated as persistent bindings, not rebuilt every Update()
+--   - Reattach only out of combat if the anchor token actually changes
 --
 -- Hard rules:
---   - NO IsAddOnLoaded / LoadAddOn (restricted env can nil those)
---   - NO secret value math/comparisons (no exp/dur math; use DurationObject)
+--   - NO IsAddOnLoaded / LoadAddOn
+--   - NO secret value math/comparisons
 --   - Private auras are NOT readable; Blizzard draws them into our "priv" frames.
 -- ============================================================================
 
@@ -14,16 +20,21 @@ local _, ns = ...
 ns.Debuffs = ns.Debuffs or {}
 local Debuffs = ns.Debuffs
 
-local UnitExists  = UnitExists
-local UnitAura    = UnitAura
-local GameTooltip = GameTooltip
-local pcall       = pcall
-local floor       = math.floor
-local max         = math.max
-local tonumber    = tonumber
-local type        = type
-local select      = select
-local ipairs      = ipairs
+local UnitExists         = UnitExists
+local UnitAura           = UnitAura
+local GameTooltip        = GameTooltip
+local InCombatLockdown   = InCombatLockdown
+local CreateFrame        = CreateFrame
+local pcall              = pcall
+local floor              = math.floor
+local max                = math.max
+local tonumber           = tonumber
+local type               = type
+local select             = select
+local ipairs             = ipairs
+local pairs              = pairs
+local rawget             = rawget
+local format             = string.format
 
 local CUA = C_UnitAuras
 local C_Spell = C_Spell
@@ -74,7 +85,7 @@ SlashCmdList.ROBHEALDEBUFFDUMP = function()
         "GetAuraDuration:", GetAuraDuration and "YES" or "NO",
         "AddPrivateAuraAnchor:", (CUA and CUA.AddPrivateAuraAnchor) and "YES" or "NO",
         "RemovePrivateAuraAnchor:", (CUA and CUA.RemovePrivateAuraAnchor) and "YES" or "NO",
-        "SetCooldownFromDurationObject:", (CreateFrame("Cooldown"):GetObjectType() and true) and "MAYBE" or "?"
+        "InCombatLockdown:", InCombatLockdown and "YES" or "NO"
     )
 end
 
@@ -103,6 +114,13 @@ local function GetSpellTextureSafe(spellId)
     local ok, tex = pcall(C_Spell.GetSpellTexture, spellId)
     if ok then return tex end
     return nil
+end
+
+local function ResolveAnchorUnit(frame, unit)
+    if frame and frame._stableUnit then
+        return frame._stableUnit
+    end
+    return unit
 end
 
 -- ============================================================
@@ -231,22 +249,26 @@ local function RemovePrivateAnchors(ui)
         if b._cover then b._cover:Hide() end
         b._hasDraw = false
     end
+
     ui._paUnit = nil
 end
 
-local function EnsurePrivateAnchors(ui, unit)
-    if not ui or not unit then return end
-    if not (CUA and CUA.AddPrivateAuraAnchor) then return end
-    if ui._paUnit == unit then return end
+local function ApplyPrivateAnchors(ui, anchorUnit)
+    if not ui or not anchorUnit then return false end
+    if not (CUA and CUA.AddPrivateAuraAnchor) then return false end
+    if ui._paUnit == anchorUnit then return true end
+    if InCombatLockdown and InCombatLockdown() then return false end
 
     RemovePrivateAnchors(ui)
-    ui._paUnit = unit
+
+    ui._paUnit = anchorUnit
+    ui._pendingPAUnit = nil
 
     for idx = 1, MAX_PRIVATE do
         local b = ui.private.icons[idx]
         if b and b.priv then
             local ok, id = pcall(CUA.AddPrivateAuraAnchor, {
-                unitToken = unit,
+                unitToken = anchorUnit,
                 auraIndex = idx,
                 parent = b.priv,
 
@@ -273,7 +295,21 @@ local function EnsurePrivateAnchors(ui, unit)
         end
     end
 
-    dprint("Private anchors set for", unit)
+    dprint("Private anchors set for", anchorUnit)
+    return true
+end
+
+local function EnsurePrivateAnchors(ui, anchorUnit)
+    if not ui or not anchorUnit then return end
+    if ui._paUnit == anchorUnit then return end
+
+    if InCombatLockdown and InCombatLockdown() then
+        ui._pendingPAUnit = anchorUnit
+        dprint("Deferred private anchors for", anchorUnit)
+        return
+    end
+
+    ApplyPrivateAnchors(ui, anchorUnit)
 end
 
 -- ============================================================
@@ -449,19 +485,22 @@ local function Ensure(frame)
 
     frame._rhDebuffs = {
         holder = holder,
+        owner = frame,
         private = { row = privRow, icons = privIcons },
         normal  = { row = normRow, icons = normIcons },
         _paUnit = nil,
+        _pendingPAUnit = nil,
         _coverKey = nil,
     }
+
+    Debuffs._tracked = Debuffs._tracked or setmetatable({}, { __mode = "k" })
+    Debuffs._tracked[frame] = true
 
     return frame._rhDebuffs
 end
 
 -- ============================================================
 -- NORMAL DEBUFF COLLECTION (12.0 SAFE)
---   - Prefer AuraInstanceID (DurationObject possible)
---   - Midnight fix: do NOT break on missing icon
 -- ============================================================
 local function CollectNormal(unit)
     if not unit or not UnitExists(unit) then return nil end
@@ -475,9 +514,6 @@ local function CollectNormal(unit)
             end)
             if (not ok) or (not aura) then break end
 
-            -- MIDNIGHT FIX:
-            -- Was: if not aura.icon then break end
-            -- Now: keep scanning; some auras may not have icon
             if aura.icon then
                 list[#list + 1] = {
                     auraIndex      = i,
@@ -515,6 +551,24 @@ local function CollectNormal(unit)
 end
 
 -- ============================================================
+-- REGEN HANDLER
+-- ============================================================
+if not Debuffs._regenFrame then
+    Debuffs._regenFrame = CreateFrame("Frame")
+    Debuffs._regenFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+    Debuffs._regenFrame:SetScript("OnEvent", function()
+        if not Debuffs._tracked then return end
+
+        for frame in pairs(Debuffs._tracked) do
+            local ui = frame and frame._rhDebuffs
+            if ui and ui._pendingPAUnit then
+                ApplyPrivateAnchors(ui, ui._pendingPAUnit)
+            end
+        end
+    end)
+end
+
+-- ============================================================
 -- PUBLIC API
 -- ============================================================
 function Debuffs:Attach(frame)
@@ -528,6 +582,11 @@ function Debuffs:Attach(frame)
         "AddPrivateAuraAnchor:", (CUA and CUA.AddPrivateAuraAnchor) and "YES" or "NO"
     )
 
+    local anchorUnit = ResolveAnchorUnit(frame, frame.unit)
+    if anchorUnit and not (InCombatLockdown and InCombatLockdown()) then
+        EnsurePrivateAnchors(ui, anchorUnit)
+    end
+
     return ui
 end
 
@@ -535,21 +594,29 @@ function Debuffs:Update(frame, unit)
     local ui = Ensure(frame)
     local holder = ui.holder
 
+    local anchorUnit = ResolveAnchorUnit(frame, unit)
+
     if not unit or not UnitExists(unit) then
         holder:Hide()
-        RemovePrivateAnchors(ui)
+
+        -- IMPORTANT:
+        -- Do NOT remove private anchors here.
+        -- They are persistent and bound to stable unit tokens.
+        -- Rebuilding/removing these during combat is what caused the blocked action.
         return
     end
 
     holder:Show()
 
-    EnsurePrivateAnchors(ui, unit)
+    if anchorUnit then
+        EnsurePrivateAnchors(ui, anchorUnit)
+    end
 
     do
         local r, g, b, a = GetHPBarColor(frame)
         if not r then r, g, b, a = 0, 0, 0, 0.85 end
 
-        local key = string.format("%.3f:%.3f:%.3f:%.3f", r, g, b, a)
+        local key = format("%.3f:%.3f:%.3f:%.3f", r, g, b, a)
         if ui._coverKey ~= key then
             ui._coverKey = key
             for _, icon in ipairs(ui.private.icons) do
@@ -561,8 +628,8 @@ function Debuffs:Update(frame, unit)
     end
 
     local list = CollectNormal(unit)
-
     local icons = ui.normal.icons
+
     for slot = 1, MAX_NORMAL do
         local b = icons[slot]
         local a = list and list[slot] or nil
@@ -576,7 +643,9 @@ function Debuffs:Update(frame, unit)
             local okSet = pcall(function() b.icon:SetTexture(a.icon) end)
             if (not okSet) or (not b.icon:GetTexture()) then
                 local tex = GetSpellTextureSafe(a.spellId)
-                if tex then pcall(function() b.icon:SetTexture(tex) end) end
+                if tex then
+                    pcall(function() b.icon:SetTexture(tex) end)
+                end
             end
 
             local c = SafeToNumber(a.count)
