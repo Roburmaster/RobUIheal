@@ -29,7 +29,9 @@
 --  - Short names (strip realm + max chars)
 --
 -- NOTE (12.0 / secret-safety):
---  - No manual % math. Only show % if UnitHealthPercent exists and returns a normal number.
+--  - No manual comparisons/math on secret health values.
+--  - No string ops on secret names.
+--  - % text only shown through safe handling.
 -- ============================================================================
 
 local ADDON, ns = ...
@@ -63,9 +65,43 @@ local pairs    = pairs
 local tostring = tostring
 local tonumber = tonumber
 local type     = type
+local pcall    = pcall
 
 local function GetDB()
     return ns:GetRaidDB()
+end
+
+local function IsSecretValue(v)
+    local f = _G.issecretvalue
+    if type(f) == "function" then
+        local ok, ret = pcall(f, v)
+        if ok and ret then
+            return true
+        end
+    end
+    return false
+end
+
+local function SafeSetText(fs, text)
+    if not fs then return end
+    if text == nil then text = "" end
+    pcall(fs.SetText, fs, text)
+end
+
+local function SafeSetFormattedText(fs, fmt, ...)
+    if not fs then return false end
+    local ok = pcall(fs.SetFormattedText, fs, fmt, ...)
+    return ok and true or false
+end
+
+local function SafeSetMinMax(bar, mn, mx)
+    if not bar then return end
+    pcall(bar.SetMinMaxValues, bar, mn, mx)
+end
+
+local function SafeSetValue(bar, v)
+    if not bar then return end
+    pcall(bar.SetValue, bar, v)
 end
 
 local function IsSafeUnitForHP(unit)
@@ -88,13 +124,72 @@ local function RoleLetter(role)
     return ""
 end
 
-local function ShortName(full)
-    if not full or full == "" then return "" end
+local function ShortNameSafe(full)
+    if full == nil then return "" end
+    if IsSecretValue(full) then return full end
+    if type(full) ~= "string" then
+        full = tostring(full or "")
+    end
+
     local nameOnly = full:match("^[^-]+") or full
     if #nameOnly > NAME_MAX_CHARS then
         return nameOnly:sub(1, NAME_MAX_CHARS) .. "…"
     end
     return nameOnly
+end
+
+local function GetDisplayName(unit, frame)
+    local name = UnitName(unit)
+
+    if name == nil then
+        if frame and frame._rhRC_Name then
+            return frame._rhRC_Name
+        end
+        return ""
+    end
+
+    if IsSecretValue(name) then
+        if frame and frame._rhRC_Name and frame._rhRC_Name ~= "" then
+            return frame._rhRC_Name
+        end
+        return name
+    end
+
+    local short = ShortNameSafe(name)
+
+    if frame then
+        frame._rhRC_Name = short
+    end
+
+    return short
+end
+
+local function GetSortName(unit)
+    local name = UnitName(unit)
+    if not name or IsSecretValue(name) or type(name) ~= "string" then
+        return unit or ""
+    end
+    return name
+end
+
+local function GetHealthValues(unit)
+    local cur = UnitHealth(unit)
+    local mx  = UnitHealthMax(unit)
+
+    if cur == nil then cur = 0 end
+    if mx == nil then mx = 1 end
+
+    return cur, mx
+end
+
+local function GetPowerValues(unit)
+    local cur = UnitPower(unit)
+    local mx  = UnitPowerMax(unit)
+
+    if cur == nil then cur = 0 end
+    if mx == nil then mx = 1 end
+
+    return cur, mx
 end
 
 local function SoftHide(frame)
@@ -174,12 +269,22 @@ local function UpdateTargetedSquare(frame, unit)
         if type(ts.IsUnitTargeted) == "function" then
             local ok, v = pcall(ts.IsUnitTargeted, ts, unit)
             targeted = ok and v and true or false
+
         elseif type(ts.IsTargeted) == "function" then
             local ok, v = pcall(ts.IsTargeted, ts, unit)
             targeted = ok and v and true or false
+
         elseif type(ts.GetUnitTargetedCount) == "function" then
             local ok, v = pcall(ts.GetUnitTargetedCount, ts, unit)
-            targeted = ok and (tonumber(v) or 0) > 0 or false
+            if ok and v ~= nil then
+                if IsSecretValue(v) then
+                    targeted = true
+                else
+                    targeted = (tonumber(v) or 0) > 0
+                end
+            else
+                targeted = false
+            end
         end
     end
 
@@ -408,14 +513,14 @@ local function CreateUnitButton(stableUnit)
     btn.power:SetHeight(POWER_H)
     btn.power:SetStatusBarTexture(TEX)
     btn.power:SetStatusBarColor(0.12, 0.42, 1.0)
-    btn.power:SetMinMaxValues(0, 1)
-    btn.power:SetValue(1)
+    SafeSetMinMax(btn.power, 0, 1)
+    SafeSetValue(btn.power, 1)
     btn.power:Hide()
 
     btn.hp = CreateFrame("StatusBar", nil, btn)
     btn.hp:SetStatusBarTexture(TEX)
-    btn.hp:SetMinMaxValues(0, 1)
-    btn.hp:SetValue(1)
+    SafeSetMinMax(btn.hp, 0, 1)
+    SafeSetValue(btn.hp, 1)
 
     btn.hpbg = btn.hp:CreateTexture(nil, "BACKGROUND")
     btn.hpbg:SetAllPoints()
@@ -531,8 +636,13 @@ function Raid:GetUnits()
             local rb = UnitGroupRolesAssigned(b)
             local da = RoleRank(ra)
             local dbb = RoleRank(rb)
-            if da ~= dbb then return da < dbb end
-            return (UnitName(a) or "") < (UnitName(b) or "")
+            if da ~= dbb then
+                return da < dbb
+            end
+
+            local na = GetSortName(a)
+            local nb = GetSortName(b)
+            return na < nb
         end)
     end
 
@@ -703,18 +813,23 @@ function Raid:Apply(frame)
 
     UpdatePowerLayout(frame, db.showPower)
 
-    if frame._rhDebuffs then PlaceDebuffs(frame) end
+    if frame._rhDebuffs then
+        PlaceDebuffs(frame)
+    end
 
     local FriendlyBuffs = ns.FriendlyBuffs
-    if FriendlyBuffs and FriendlyBuffs.Place then FriendlyBuffs:Place(frame) end
+    if FriendlyBuffs and FriendlyBuffs.Place then
+        FriendlyBuffs:Place(frame)
+    end
 
-    frame.nameText:SetText(ShortName(UnitName(u) or ""))
+    local displayName = GetDisplayName(u, frame)
+    SafeSetText(frame.nameText, displayName)
 
     if db.showRole then
-        frame.roleText:SetText(RoleLetter(UnitGroupRolesAssigned(u)))
+        SafeSetText(frame.roleText, RoleLetter(UnitGroupRolesAssigned(u)))
         frame.roleText:Show()
     else
-        frame.roleText:SetText("")
+        SafeSetText(frame.roleText, "")
         frame.roleText:Hide()
     end
 
@@ -728,35 +843,40 @@ function Raid:Apply(frame)
         frame.nameText:SetPoint("CENTER", frame.nameBar, "CENTER", 0, 0)
     end
 
-    local cur = UnitHealth(u)
-    local mx  = UnitHealthMax(u)
-
-    cur = tonumber(cur) or 0
-    mx  = tonumber(mx) or 1
-    if mx <= 0 then mx = 1 end
-
-    frame.hp:SetMinMaxValues(0, mx)
-    frame.hp:SetValue(cur)
+    local cur, mx = GetHealthValues(u)
+    SafeSetMinMax(frame.hp, 0, mx)
+    SafeSetValue(frame.hp, cur)
 
     if frame._hpPctText then
         if not IsSafeUnitForHP(u) then
-            frame._hpPctText:SetText("")
+            SafeSetText(frame._hpPctText, "")
         elseif UnitIsDeadOrGhost(u) then
-            frame._hpPctText:SetText("0%")
+            SafeSetText(frame._hpPctText, "0%")
         elseif UnitHealthPercent then
-            local percentValue
+            local percentValue = nil
             local ok = pcall(function()
                 local scaling = (CurveConstants and CurveConstants.ScaleTo100) or 1
                 percentValue = UnitHealthPercent(u, true, scaling)
             end)
-            percentValue = ok and tonumber(percentValue) or nil
-            if percentValue then
-                frame._hpPctText:SetText(string.format("%d%%", percentValue))
+
+            if ok and percentValue ~= nil then
+                if IsSecretValue(percentValue) then
+                    if not SafeSetFormattedText(frame._hpPctText, "%d%%", percentValue) then
+                        SafeSetText(frame._hpPctText, "")
+                    end
+                else
+                    local n = tonumber(percentValue)
+                    if n then
+                        SafeSetText(frame._hpPctText, string.format("%d%%", n))
+                    else
+                        SafeSetText(frame._hpPctText, "")
+                    end
+                end
             else
-                frame._hpPctText:SetText("")
+                SafeSetText(frame._hpPctText, "")
             end
         else
-            frame._hpPctText:SetText("")
+            SafeSetText(frame._hpPctText, "")
         end
 
         frame._hpPctText:Show()
@@ -776,11 +896,9 @@ function Raid:Apply(frame)
     end
 
     if db.showPower then
-        local p = tonumber(UnitPower(u)) or 0
-        local pm = tonumber(UnitPowerMax(u)) or 1
-        if pm <= 0 then pm = 1 end
-        frame.power:SetMinMaxValues(0, pm)
-        frame.power:SetValue(p)
+        local p, pm = GetPowerValues(u)
+        SafeSetMinMax(frame.power, 0, pm)
+        SafeSetValue(frame.power, p)
     end
 
     if Dispel and Dispel.Update then Dispel:Update(frame, u) end
@@ -790,7 +908,9 @@ function Raid:Apply(frame)
     if ns.HealAbsorb   and ns.HealAbsorb.Update   then ns.HealAbsorb:Update(frame, u, cur, mx) end
     if ns.ShieldAbsorb and ns.ShieldAbsorb.Update then ns.ShieldAbsorb:Update(frame, u, cur, mx) end
 
-    if FriendlyBuffs and FriendlyBuffs.Update then FriendlyBuffs:Update(frame, u) end
+    if FriendlyBuffs and FriendlyBuffs.Update then
+        FriendlyBuffs:Update(frame, u)
+    end
 
     EnsureTargetedSquare(frame)
     UpdateTargetedSquare(frame, u)
@@ -971,9 +1091,7 @@ function Raid:OnUnit(unit, event)
     end
 
     if event == "UNIT_HEAL_PREDICTION" or event == "UNIT_ABSORB_AMOUNT_CHANGED" or event == "UNIT_HEAL_ABSORB_AMOUNT_CHANGED" then
-        local cur = tonumber(UnitHealth(unit)) or 0
-        local mx  = tonumber(UnitHealthMax(unit)) or 1
-        if mx <= 0 then mx = 1 end
+        local cur, mx = GetHealthValues(unit)
         if ns.IncomingHeals and ns.IncomingHeals.Update then ns.IncomingHeals:Update(f, unit, cur, mx) end
         if ns.HealAbsorb   and ns.HealAbsorb.Update   then ns.HealAbsorb:Update(f, unit, cur, mx) end
         if ns.ShieldAbsorb and ns.ShieldAbsorb.Update then ns.ShieldAbsorb:Update(f, unit, cur, mx) end
