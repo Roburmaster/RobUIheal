@@ -1,6 +1,7 @@
 -- ============================================================================
--- party.lua (RobHeal) v1.1
+-- party.lua (RobHeal)
 -- Party frames (no SecureHeader). Uses db.lua: ns:GetPartyDB() (role-profile aware).
+-- Midnight-safe / secret-safe hardened for hostile/charm/takeover states.
 -- ============================================================================
 
 local ADDON, ns = ...
@@ -16,13 +17,54 @@ local Debuffs = ns.Debuffs
 local TEX     = "Interface\\Buttons\\WHITE8X8"
 local POWER_H = 3
 
-Party.frames     = Party.frames or {}
-Party.eventFrame = Party.eventFrame or nil
-Party.mover      = Party.mover or nil
+Party.frames       = Party.frames or {}
+Party.eventFrame   = Party.eventFrame or nil
+Party.mover        = Party.mover or nil
 Party.selectedUnit = Party.selectedUnit or nil
+
+local pcall        = pcall
+local type         = type
+local ipairs       = ipairs
+local pairs        = pairs
+local tostring     = tostring
+local math_floor   = math.floor
+local table_sort   = table.sort
 
 local function GetDB()
     return ns:GetPartyDB()
+end
+
+local function IsSecretValue(v)
+    local f = _G.issecretvalue
+    if type(f) == "function" then
+        local ok, ret = pcall(f, v)
+        if ok and ret then
+            return true
+        end
+    end
+    return false
+end
+
+local function SafeSetText(fs, text)
+    if not fs then return end
+    if text == nil then text = "" end
+    pcall(fs.SetText, fs, text)
+end
+
+local function SafeSetFormattedText(fs, fmt, ...)
+    if not fs then return false end
+    local ok = pcall(fs.SetFormattedText, fs, fmt, ...)
+    return ok and true or false
+end
+
+local function SafeSetMinMax(bar, mn, mx)
+    if not bar then return end
+    pcall(bar.SetMinMaxValues, bar, mn, mx)
+end
+
+local function SafeSetValue(bar, v)
+    if not bar then return end
+    pcall(bar.SetValue, bar, v)
 end
 
 local function IsSafeUnitForHP(unit)
@@ -122,6 +164,67 @@ local function EnsureSelectedHighlight(btn)
     btn._rhSelectedBorder = b
 end
 
+local function GetDisplayName(unit, frame)
+    local name = UnitName(unit)
+
+    if name == nil then
+        if frame and frame._rhRC_Name then
+            return frame._rhRC_Name
+        end
+        return ""
+    end
+
+    if IsSecretValue(name) then
+        if frame and frame._rhRC_Name and frame._rhRC_Name ~= "" then
+            return frame._rhRC_Name
+        end
+        return name
+    end
+
+    if type(name) ~= "string" then
+        name = tostring(name or "")
+    end
+
+    local short = name
+    if #short > 18 then
+        short = short:sub(1, 18)
+    end
+
+    if frame then
+        frame._rhRC_Name = short
+    end
+
+    return short
+end
+
+local function GetSortName(unit)
+    local name = UnitName(unit)
+    if not name or IsSecretValue(name) or type(name) ~= "string" then
+        return unit or ""
+    end
+    return name
+end
+
+local function GetHealthValues(unit)
+    local cur = UnitHealth(unit)
+    local mx  = UnitHealthMax(unit)
+
+    if cur == nil then cur = 0 end
+    if mx  == nil then mx  = 1 end
+
+    return cur, mx
+end
+
+local function GetPowerValues(unit)
+    local cur = UnitPower(unit)
+    local mx  = UnitPowerMax(unit)
+
+    if cur == nil then cur = 0 end
+    if mx  == nil then mx  = 1 end
+
+    return cur, mx
+end
+
 function Party:SetSelectedUnit(unit)
     self.selectedUnit = unit
     self:UpdateSelectionHighlights()
@@ -184,8 +287,8 @@ local function CreateMover()
 
         db.point    = p or db.point
         db.relPoint = rp or db.relPoint
-        db.x        = math.floor((x or 0) + 0.5)
-        db.y        = math.floor((y or 0) + 0.5)
+        db.x        = math_floor((x or 0) + 0.5)
+        db.y        = math_floor((y or 0) + 0.5)
 
         if ns.RequestPartyRebuild then ns:RequestPartyRebuild() else Party:Build() end
     end)
@@ -223,14 +326,14 @@ local function CreateUnitButton()
     btn.power:SetHeight(POWER_H)
     btn.power:SetStatusBarTexture(TEX)
     btn.power:SetStatusBarColor(0.12, 0.42, 1.0)
-    btn.power:SetMinMaxValues(0, 1)
-    btn.power:SetValue(1)
+    SafeSetMinMax(btn.power, 0, 1)
+    SafeSetValue(btn.power, 1)
     btn.power:Hide()
 
     btn.hp = CreateFrame("StatusBar", nil, btn)
     btn.hp:SetStatusBarTexture(TEX)
-    btn.hp:SetMinMaxValues(0, 1)
-    btn.hp:SetValue(1)
+    SafeSetMinMax(btn.hp, 0, 1)
+    SafeSetValue(btn.hp, 1)
 
     btn.hpbg = btn.hp:CreateTexture(nil, "BACKGROUND")
     btn.hpbg:SetAllPoints()
@@ -257,7 +360,7 @@ local function CreateUnitButton()
     if not btn._hpPctOverlay then
         local o = CreateFrame("Frame", nil, UIParent)
         o:SetFrameStrata("MEDIUM")
-        o:SetFrameLevel(btn:GetFrameLevel() + 2) -- Lowered from 9999 to tie it to the button
+        o:SetFrameLevel(btn:GetFrameLevel() + 2)
         o:SetClampedToScreen(true)
         o:Show()
 
@@ -315,13 +418,18 @@ function Party:GetUnits()
 
     local db = GetDB()
     if db.sort == "ROLE" then
-        table.sort(list, function(a, b)
+        table_sort(list, function(a, b)
             local ra = UnitGroupRolesAssigned(a)
             local rb = UnitGroupRolesAssigned(b)
             local da = RoleRank(ra)
             local dbb = RoleRank(rb)
-            if da ~= dbb then return da < dbb end
-            return (UnitName(a) or "") < (UnitName(b) or "")
+            if da ~= dbb then
+                return da < dbb
+            end
+
+            local na = GetSortName(a)
+            local nb = GetSortName(b)
+            return na < nb
         end)
     end
 
@@ -338,14 +446,16 @@ function Party:Apply(frame)
     if frame._rhDebuffs then PlaceDebuffs(frame) end
 
     local FriendlyBuffs = ns.FriendlyBuffs
-    if FriendlyBuffs and FriendlyBuffs.Place then FriendlyBuffs:Place(frame) end
+    if FriendlyBuffs and FriendlyBuffs.Place then
+        FriendlyBuffs:Place(frame)
+    end
 
-    local name = UnitName(u) or ""
-    frame.nameText:SetText(name:len() > 18 and name:sub(1, 18) or name)
+    local displayName = GetDisplayName(u, frame)
+    SafeSetText(frame.nameText, displayName)
 
     if db.showRole then
         local role = UnitGroupRolesAssigned(u)
-        frame.roleText:SetText(RoleLetter(role))
+        SafeSetText(frame.roleText, RoleLetter(role))
 
         if role == "TANK" then
             frame.roleText:SetTextColor(0.2, 0.6, 1.0, 1)
@@ -357,43 +467,65 @@ function Party:Apply(frame)
 
         frame.roleText:Show()
     else
-        frame.roleText:SetText("")
+        SafeSetText(frame.roleText, "")
         frame.roleText:Hide()
     end
 
-    local cur, mx = UnitHealth(u) or 0, UnitHealthMax(u) or 1
-    if mx <= 0 then mx = 1 end
-    frame.hp:SetMinMaxValues(0, mx)
-    frame.hp:SetValue(cur)
+    local cur, mx = GetHealthValues(u)
+    SafeSetMinMax(frame.hp, 0, mx)
+    SafeSetValue(frame.hp, cur)
 
     if frame._hpPctText then
         if not IsSafeUnitForHP(u) then
-            frame._hpPctText:SetText("")
+            SafeSetText(frame._hpPctText, "")
         elseif UnitIsDeadOrGhost(u) then
-            frame._hpPctText:SetText("0%")
+            SafeSetText(frame._hpPctText, "0%")
         else
-            local percentValue
+            local percentValue = nil
+
             if UnitHealthPercent then
-                local scaling = (CurveConstants and CurveConstants.ScaleTo100) or 1
-                percentValue = UnitHealthPercent(u, true, scaling)
+                local ok = pcall(function()
+                    local scaling = (CurveConstants and CurveConstants.ScaleTo100) or 1
+                    percentValue = UnitHealthPercent(u, true, scaling)
+                end)
+                if not ok then
+                    percentValue = nil
+                end
             else
                 local ok = pcall(function()
-                    local maxH = UnitHealthMax(u) or 1
-                    local curH = UnitHealth(u, true) or 0
-                    percentValue = (curH / maxH) * 100
+                    local maxH = UnitHealthMax(u)
+                    local curH = UnitHealth(u, true)
+                    if maxH and curH then
+                        percentValue = (curH / maxH) * 100
+                    end
                 end)
-                if not ok then percentValue = nil end
+                if not ok then
+                    percentValue = nil
+                end
             end
 
-            percentValue = tonumber(percentValue)
-            if percentValue then
-                frame._hpPctText:SetText(string.format("%d%%", percentValue))
+            if percentValue ~= nil then
+                if IsSecretValue(percentValue) then
+                    if not SafeSetFormattedText(frame._hpPctText, "%d%%", percentValue) then
+                        SafeSetText(frame._hpPctText, "")
+                    end
+                else
+                    local n = tonumber(percentValue)
+                    if n then
+                        SafeSetText(frame._hpPctText, string.format("%d%%", n))
+                    else
+                        SafeSetText(frame._hpPctText, "")
+                    end
+                end
             else
-                frame._hpPctText:SetText("")
+                SafeSetText(frame._hpPctText, "")
             end
         end
+
         frame._hpPctText:Show()
-        if frame._hpPctOverlay then frame._hpPctOverlay:Show() end
+        if frame._hpPctOverlay then
+            frame._hpPctOverlay:Show()
+        end
     end
 
     if db.classColor then
@@ -409,11 +541,9 @@ function Party:Apply(frame)
     end
 
     if db.showPower then
-        local p = UnitPower(u) or 0
-        local pm = UnitPowerMax(u) or 1
-        if pm <= 0 then pm = 1 end
-        frame.power:SetMinMaxValues(0, pm)
-        frame.power:SetValue(p)
+        local p, pm = GetPowerValues(u)
+        SafeSetMinMax(frame.power, 0, pm)
+        SafeSetValue(frame.power, p)
     end
 
     if Dispel and Dispel.Update then Dispel:Update(frame, u) end
@@ -423,7 +553,9 @@ function Party:Apply(frame)
     if ns.HealAbsorb   and ns.HealAbsorb.Update   then ns.HealAbsorb:Update(frame, u, cur, mx) end
     if ns.ShieldAbsorb and ns.ShieldAbsorb.Update then ns.ShieldAbsorb:Update(frame, u, cur, mx) end
 
-    if FriendlyBuffs and FriendlyBuffs.Update then FriendlyBuffs:Update(frame, u) end
+    if FriendlyBuffs and FriendlyBuffs.Update then
+        FriendlyBuffs:Update(frame, u)
+    end
 
     local TargetedSpells = ns.TargetedSpells
     if TargetedSpells and TargetedSpells.UpdateFrame then
@@ -485,7 +617,9 @@ function Party:Build()
                 if f._hpPctOverlay then f._hpPctOverlay:Hide() end
             end
         else
-            for _, f in ipairs(self.frames) do SoftHide(f) end
+            for _, f in ipairs(self.frames) do
+                SoftHide(f)
+            end
         end
         if self.mover then self.mover:Hide() end
         return
@@ -501,7 +635,9 @@ function Party:Build()
                 if f._hpPctOverlay then f._hpPctOverlay:Hide() end
             end
         else
-            for _, f in ipairs(self.frames) do SoftHide(f) end
+            for _, f in ipairs(self.frames) do
+                SoftHide(f)
+            end
         end
         return
     end
@@ -518,7 +654,9 @@ function Party:Build()
 
         f.unit = units[i]
 
-        if not InCombatLockdown() then f:Show() end
+        if not InCombatLockdown() then
+            f:Show()
+        end
         SoftShow(f)
 
         if _G.RobHeal_RegisterFrame then
@@ -563,8 +701,7 @@ function Party:OnUnit(unit, event)
     if event == "UNIT_HEAL_PREDICTION" or event == "UNIT_ABSORB_AMOUNT_CHANGED" or event == "UNIT_HEAL_ABSORB_AMOUNT_CHANGED" then
         for _, f in ipairs(self.frames) do
             if f:IsShown() and f.unit == unit then
-                local cur, mx = UnitHealth(unit) or 0, UnitHealthMax(unit) or 1
-                if mx <= 0 then mx = 1 end
+                local cur, mx = GetHealthValues(unit)
                 if ns.IncomingHeals and ns.IncomingHeals.Update then ns.IncomingHeals:Update(f, unit, cur, mx) end
                 if ns.HealAbsorb   and ns.HealAbsorb.Update   then ns.HealAbsorb:Update(f, unit, cur, mx) end
                 if ns.ShieldAbsorb and ns.ShieldAbsorb.Update then ns.ShieldAbsorb:Update(f, unit, cur, mx) end
@@ -636,6 +773,9 @@ function Party:Init()
         end
     end)
 
+    if ns.UpdateActiveProfile then ns:UpdateActiveProfile(true) end
+    if ns.RequestPartyRebuild then ns:RequestPartyRebuild() else Party:Build() end
+end
     if ns.UpdateActiveProfile then ns:UpdateActiveProfile(true) end
     if ns.RequestPartyRebuild then ns:RequestPartyRebuild() else Party:Build() end
 end
